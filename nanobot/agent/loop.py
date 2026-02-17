@@ -146,12 +146,14 @@ class AgentLoop:
             if isinstance(cron_tool, CronTool):
                 cron_tool.set_context(channel, chat_id)
 
-    async def _run_agent_loop(self, initial_messages: list[dict]) -> tuple[str | None, list[str]]:
+    async def _run_agent_loop(self, initial_messages: list[dict], channel: str, chat_id: str) -> tuple[str | None, list[str]]:
         """
         Run the agent iteration loop.
 
         Args:
             initial_messages: Starting messages for the LLM conversation.
+            channel: Source channel for event emission.
+            chat_id: Source chat ID for event emission.
 
         Returns:
             Tuple of (final_content, list_of_tools_used).
@@ -164,6 +166,15 @@ class AgentLoop:
         while iteration < self.max_iterations:
             iteration += 1
 
+            # Emit thinking event
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=channel,
+                chat_id=chat_id,
+                content="",
+                event_type="thinking",
+                metadata={"iteration": iteration}
+            ))
+
             response = await self.provider.chat(
                 messages=messages,
                 tools=self.tools.get_definitions(),
@@ -171,6 +182,16 @@ class AgentLoop:
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
             )
+
+            # If response has reasoning (e.g. DeepSeek-R1), emit it as a thinking event
+            if response.reasoning_content:
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=channel,
+                    chat_id=chat_id,
+                    content=response.reasoning_content,
+                    event_type="thinking",
+                    metadata={"is_reasoning": True, "iteration": iteration}
+                ))
 
             if response.has_tool_calls:
                 tool_call_dicts = [
@@ -193,7 +214,36 @@ class AgentLoop:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
+
+                    # Emit tool_call event
+                    await self.bus.publish_outbound(OutboundMessage(
+                        channel=channel,
+                        chat_id=chat_id,
+                        content="",
+                        event_type="tool_call",
+                        metadata={
+                            "tool": tool_call.name,
+                            "arguments": tool_call.arguments,
+                            "tool_call_id": tool_call.id,
+                            "iteration": iteration
+                        }
+                    ))
+
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
+
+                    # Emit tool_result event
+                    await self.bus.publish_outbound(OutboundMessage(
+                        channel=channel,
+                        chat_id=chat_id,
+                        content=str(result),
+                        event_type="tool_result",
+                        metadata={
+                            "tool": tool_call.name,
+                            "tool_call_id": tool_call.id,
+                            "iteration": iteration
+                        }
+                    ))
+
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -297,7 +347,7 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=msg.chat_id,
         )
-        final_content, tools_used = await self._run_agent_loop(initial_messages)
+        final_content, tools_used = await self._run_agent_loop(initial_messages, msg.channel, msg.chat_id)
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
@@ -345,7 +395,7 @@ class AgentLoop:
             channel=origin_channel,
             chat_id=origin_chat_id,
         )
-        final_content, _ = await self._run_agent_loop(initial_messages)
+        final_content, _ = await self._run_agent_loop(initial_messages, origin_channel, origin_chat_id)
 
         if final_content is None:
             final_content = "Background task completed."

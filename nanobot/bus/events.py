@@ -33,5 +33,7 @@ class OutboundMessage:
     reply_to: str | None = None
     media: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    event_type: str = "message"  # message, thinking, tool_call, tool_result, error
+    timestamp: datetime = field(default_factory=datetime.now)
 
 
