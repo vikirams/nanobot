@@ -393,7 +393,7 @@ def gateway(
     )
     
     # Create channel manager
-    channels = ChannelManager(config, bus, session_manager=session_manager)
+    channels = ChannelManager(config, bus)
     
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
@@ -602,14 +602,6 @@ def channels_status():
         "Slack",
         "✓" if slack.enabled else "✗",
         slack_config
-    )
-
-    # Web
-    web = config.channels.web
-    table.add_row(
-        "Web",
-        "✓" if web.enabled else "✗",
-        f"{web.host}:{web.port}"
     )
 
     console.print(table)

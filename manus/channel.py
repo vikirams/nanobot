@@ -35,7 +35,7 @@ if FASTAPI_AVAILABLE:
         sender_id: str = "user"
         metadata: dict[str, Any] = {}
 
-class WebChannel(BaseChannel):
+class ManusWebChannel(BaseChannel):
     """
     Web channel that provides a REST API and SSE streaming for agent interaction.
     """
@@ -46,7 +46,7 @@ class WebChannel(BaseChannel):
         super().__init__(config, bus)
         self.session_manager = session_manager
         if FASTAPI_AVAILABLE:
-            self.app = FastAPI(title="nanobot Web API")
+            self.app = FastAPI(title="nanobot Web API (Manus Extension)")
             self.app.add_middleware(
                 CORSMiddleware,
                 allow_origins=getattr(config, "cors_origins", ["*"]),
@@ -83,7 +83,6 @@ class WebChannel(BaseChannel):
         async def get_session(session_id: str):
             if not self.session_manager:
                 return {"error": "Session manager not available"}
-            # We use the full session key here
             session = self.session_manager.get_or_create(f"web:{session_id}")
             return {
                 "session_id": session_id,
@@ -100,16 +99,19 @@ class WebChannel(BaseChannel):
         self._event_queues.setdefault(chat_id, []).append(queue)
         logger.info(f"New SSE subscriber for chat_id: {chat_id}")
         try:
-            # Send initial connection event
             yield f"data: {json.dumps({'event_type': 'connected', 'chat_id': chat_id})}\n\n"
 
             while True:
                 msg: OutboundMessage = await queue.get()
+                # Extract event_type from metadata if possible, otherwise default to "message"
+                event_type = msg.metadata.get("event_type", "message")
+                timestamp = msg.metadata.get("timestamp") or datetime.now().isoformat()
+
                 data = {
-                    "event_type": msg.event_type,
+                    "event_type": event_type,
                     "content": msg.content,
                     "metadata": msg.metadata,
-                    "timestamp": msg.timestamp.isoformat(),
+                    "timestamp": timestamp,
                     "chat_id": msg.chat_id
                 }
                 yield f"data: {json.dumps(data)}\n\n"
@@ -154,12 +156,10 @@ class WebChannel(BaseChannel):
 
     async def send(self, msg: OutboundMessage) -> None:
         """Forward outbound messages to SSE subscribers."""
-        # Forward to specific chat_id subscribers
         if msg.chat_id in self._event_queues:
             for queue in self._event_queues[msg.chat_id]:
                 await queue.put(msg)
 
-        # Forward to global subscribers
         if "*" in self._event_queues:
             for queue in self._event_queues["*"]:
                 await queue.put(msg)
