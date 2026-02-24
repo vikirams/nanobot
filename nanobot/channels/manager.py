@@ -148,6 +148,20 @@ class ChannelManager:
                 logger.info("Matrix channel enabled")
             except ImportError as e:
                 logger.warning("Matrix channel not available: {}", e)
+
+        # Web UI channel (SSE endpoint for React / browser frontends)
+        if self.config.channels.webui.enabled:
+            try:
+                from nanobot.channels.webui import WebUIChannel
+                self.channels["webui"] = WebUIChannel(
+                    self.config.channels.webui, self.bus,
+                    workspace_path=self.config.workspace_path
+                )
+                logger.info(
+                    "WebUI channel enabled on port {}", self.config.channels.webui.port
+                )
+            except ImportError as e:
+                logger.warning("WebUI channel not available: {}", e)
     
     async def _start_channel(self, name: str, channel: BaseChannel) -> None:
         """Start a channel and log any exceptions."""
