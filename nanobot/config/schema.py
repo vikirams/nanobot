@@ -200,6 +200,16 @@ class MatrixConfig(Base):
     group_allow_from: list[str] = Field(default_factory=list)
     allow_room_mentions: bool = False
 
+class WebUIConfig(Base):
+    """Web UI channel configuration — serves an SSE endpoint for React (or any) frontends."""
+
+    enabled: bool = False
+    host: str = "0.0.0.0"
+    port: int = 8080
+    cors_origins: list[str] = Field(default_factory=list)  # e.g. ["http://localhost:5173"]
+    api_key: str = ""  # Optional Bearer token; empty = no auth required
+
+
 class ChannelsConfig(Base):
     """Configuration for chat channels."""
 
@@ -215,6 +225,7 @@ class ChannelsConfig(Base):
     slack: SlackConfig = Field(default_factory=SlackConfig)
     qq: QQConfig = Field(default_factory=QQConfig)
     matrix: MatrixConfig = Field(default_factory=MatrixConfig)
+    webui: WebUIConfig = Field(default_factory=WebUIConfig)
 
 
 class AgentDefaults(Base):
