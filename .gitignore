@@ -20,4 +20,6 @@ __pycache__/
 poetry.lock
 .pytest_cache/
 botpy.log
-
+tests/
+/webui/node_modules
+/webui/.vite

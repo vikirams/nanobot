@@ -99,3 +99,17 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
         for name in added:
             Console().print(f"  [dim]Created {name}[/dim]")
     return added
+def parse_session_key(key: str) -> tuple[str, str]:
+    """
+    Parse a session key into channel and chat_id.
+    
+    Args:
+        key: Session key in format "channel:chat_id"
+    
+    Returns:
+        Tuple of (channel, chat_id)
+    """
+    parts = key.split(":", 1)
+    if len(parts) != 2:
+        raise ValueError(f"Invalid session key: {key}")
+    return parts[0], parts[1]
