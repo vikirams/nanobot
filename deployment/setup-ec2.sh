@@ -41,13 +41,41 @@ if getent passwd ubuntu >/dev/null 2>&1; then
     chown ubuntu:ubuntu /app
 fi
 
-# Firewall: SSH, gateway (18790), WebUI (8080)
+# Firewall: SSH, gateway (18790), WebUI (8080), HTTP/HTTPS for nginx
 print_status "Configuring firewall..."
 ufw --force enable
 ufw allow 22/tcp
+ufw allow 80/tcp
+ufw allow 443/tcp
 ufw allow 18790/tcp
 ufw allow 8080/tcp
 ufw status
+
+# Nginx + Certbot (for https://agent.highperformr.ai)
+print_status "Installing nginx and certbot..."
+apt-get install -y nginx certbot python3-certbot-nginx
+
+print_status "Configuring nginx for agent.highperformr.ai..."
+cat > /etc/nginx/sites-available/agent.highperformr.ai << 'NGINX_EOF'
+server {
+    listen 80;
+    server_name agent.highperformr.ai;
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+NGINX_EOF
+ln -sf /etc/nginx/sites-available/agent.highperformr.ai /etc/nginx/sites-enabled/
+rm -f /etc/nginx/sites-enabled/default
+nginx -t && systemctl enable nginx && systemctl reload nginx
+print_status "Nginx configured; HTTPS cert: run 'sudo certbot --nginx -d agent.highperformr.ai' after DNS points here."
 
 # Optional: install aws-cli on host for debugging (container uses instance role)
 if ! command -v aws >/dev/null 2>&1; then
@@ -56,3 +84,4 @@ if ! command -v aws >/dev/null 2>&1; then
 fi
 
 print_status "EC2 setup completed. Attach an IAM role with Secrets Manager access, then run ./deployment/deploy.sh from your machine."
+print_status "After DNS (agent.highperformr.ai) points to this server, run: sudo certbot --nginx -d agent.highperformr.ai"
