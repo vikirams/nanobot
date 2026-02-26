@@ -106,7 +106,7 @@ ssh -i "$SSH_KEY" "$EC2_USER@$EC2_HOST" << EOF
         -p 18790:18790 \
         -p 8080:8080 \
         -e AWS_DEFAULT_REGION=\${AWS_DEFAULT_REGION:-us-east-1} \
-        $NANOBOT_VOL \
+        \$NANOBOT_VOL \
         ${APP_NAME}:${ENVIRONMENT}
     echo "Removing image tar from EC2..."
     rm -f /tmp/$TAR_FILE
