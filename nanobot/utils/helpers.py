@@ -19,8 +19,11 @@ def detect_image_mime(data: bytes) -> str | None:
 
 
 def ensure_dir(path: Path) -> Path:
-    """Ensure directory exists, return it."""
-    path.mkdir(parents=True, exist_ok=True)
+    """Ensure a directory exists, creating it if necessary."""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise OSError(f"Could not create directory {path!s}: {e}") from e
     return path
 
 
