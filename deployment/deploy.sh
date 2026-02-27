@@ -64,7 +64,7 @@ docker save "${APP_NAME}:${ENVIRONMENT}" -o "$TAR_FILE"
 # Create app directory (and optional nanobot data dir) on EC2
 print_status "Creating app directory on EC2..."
 if [ -n "$NANOBOT_HOST_PATH" ]; then
-    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new "$EC2_USER@$EC2_HOST" "sudo mkdir -p $EC2_PATH $NANOBOT_HOST_PATH/workspace/skills && sudo chown -R $EC2_USER:$EC2_USER $EC2_PATH $NANOBOT_HOST_PATH"
+    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new "$EC2_USER@$EC2_HOST" "sudo mkdir -p $EC2_PATH $NANOBOT_HOST_PATH/workspace/skills $NANOBOT_HOST_PATH/workspace/sessions && sudo chown -R $EC2_USER:$EC2_USER $EC2_PATH $NANOBOT_HOST_PATH"
 else
     ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new "$EC2_USER@$EC2_HOST" "sudo mkdir -p $EC2_PATH && sudo chown $EC2_USER:$EC2_USER $EC2_PATH"
 fi
