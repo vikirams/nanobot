@@ -8,7 +8,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
 
 
@@ -18,22 +17,43 @@ class ContextBuilder:
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
 
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, hybrid_memory_enabled: bool = False):
         self.workspace = workspace
-        self.memory = MemoryStore(workspace)
+        self.hybrid_memory_enabled = hybrid_memory_enabled
         self.skills = SkillsLoader(workspace)
+        self._bootstrap_cache: str | None = None
+        self._bootstrap_mtime: float = 0.0
 
-    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
-        """Build the system prompt from identity, bootstrap files, memory, and skills."""
+    def _bootstrap_mtime_now(self) -> float:
+        """Max mtime of bootstrap files for cache invalidation."""
+        m = 0.0
+        for name in self.BOOTSTRAP_FILES:
+            p = self.workspace / name
+            if p.exists():
+                try:
+                    m = max(m, p.stat().st_mtime)
+                except OSError:
+                    pass
+        return m
+
+    def build_system_prompt(
+        self,
+        skill_names: list[str] | None = None,
+        memory_context: str = "",
+    ) -> str:
+        """Build the system prompt from identity, bootstrap files, memory, and skills.
+
+        memory_context is pre-fetched by the caller (awaited from the memory store)
+        and injected here so this method can remain synchronous.
+        """
         parts = [self._get_identity()]
 
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
             parts.append(bootstrap)
 
-        memory = self.memory.get_memory_context()
-        if memory:
-            parts.append(f"# Memory\n\n{memory}")
+        if memory_context:
+            parts.append(f"# Memory\n\n{memory_context}")
 
         always_skills = self.skills.get_always_skills()
         if always_skills:
@@ -58,6 +78,18 @@ Skills with available="false" need dependencies installed first - you can try in
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
 
+        if self.hybrid_memory_enabled:
+            memory_section = (
+                "- Long-term memory: Managed automatically (SQLite + semantic search). "
+                "Memory is consolidated after each session — do NOT write to MEMORY.md directly."
+            )
+        else:
+            memory_section = (
+                f"- Long-term memory: {workspace_path}/memory/MEMORY.md (write important facts here)\n"
+                f"- History log: {workspace_path}/memory/HISTORY.md (grep-searchable). "
+                "Each entry starts with [YYYY-MM-DD HH:MM]."
+            )
+
         return f"""# nanobot 🐈
 
 You are nanobot, a helpful AI assistant.
@@ -67,8 +99,7 @@ You are nanobot, a helpful AI assistant.
 
 ## Workspace
 Your workspace is at: {workspace_path}
-- Long-term memory: {workspace_path}/memory/MEMORY.md (write important facts here)
-- History log: {workspace_path}/memory/HISTORY.md (grep-searchable). Each entry starts with [YYYY-MM-DD HH:MM].
+{memory_section}
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
 ## nanobot Guidelines
@@ -91,16 +122,18 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
 
     def _load_bootstrap_files(self) -> str:
-        """Load all bootstrap files from workspace."""
-        parts = []
-
-        for filename in self.BOOTSTRAP_FILES:
-            file_path = self.workspace / filename
-            if file_path.exists():
-                content = file_path.read_text(encoding="utf-8")
-                parts.append(f"## {filename}\n\n{content}")
-
-        return "\n\n".join(parts) if parts else ""
+        """Load all bootstrap files from workspace (cached by mtime)."""
+        current = self._bootstrap_mtime_now()
+        if current > self._bootstrap_mtime or self._bootstrap_cache is None:
+            self._bootstrap_mtime = current
+            parts = []
+            for filename in self.BOOTSTRAP_FILES:
+                file_path = self.workspace / filename
+                if file_path.exists():
+                    content = file_path.read_text(encoding="utf-8")
+                    parts.append(f"## {filename}\n\n{content}")
+            self._bootstrap_cache = "\n\n".join(parts) if parts else ""
+        return self._bootstrap_cache
 
     def build_messages(
         self,
@@ -110,6 +143,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         media: list[str] | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
+        memory_context: str = "",
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         runtime_ctx = self._build_runtime_context(channel, chat_id)
@@ -123,7 +157,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
 
         return [
-            {"role": "system", "content": self.build_system_prompt(skill_names)},
+            {"role": "system", "content": self.build_system_prompt(skill_names, memory_context=memory_context)},
             *history,
             {"role": "user", "content": merged},
         ]

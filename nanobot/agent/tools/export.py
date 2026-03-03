@@ -1,13 +1,12 @@
 """CSV export tool: convert tabular data and save to workspace for download."""
 
-import csv
-import io
 import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.discovery_helpers import to_csv_string
 
 
 class SaveCSVTool(Tool):
@@ -36,7 +35,8 @@ class SaveCSVTool(Tool):
     def description(self) -> str:
         return (
             "Save tabular data as a CSV file and return a /download/ link for the user. "
-            "Call this whenever the user asks for a CSV or file download. "
+            "ONLY call this when the user EXPLICITLY requests a download or CSV export — "
+            "NEVER call it automatically after receiving discovery results. "
             "Accepts: ClickHouse JSON ({\"meta\":[...],\"data\":[...]}), "
             "a JSON array of objects ([{...},...]), or plain CSV text."
         )
@@ -165,12 +165,4 @@ class SaveCSVTool(Tool):
 
     @staticmethod
     def _write_csv(columns: list[str], rows: list[Any]) -> str:
-        buf = io.StringIO()
-        writer = csv.DictWriter(buf, fieldnames=columns, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            if isinstance(row, dict):
-                writer.writerow(
-                    {col: ("" if row.get(col) is None else row.get(col)) for col in columns}
-                )
-        return buf.getvalue()
+        return to_csv_string([r for r in rows if isinstance(r, dict)], columns=columns)

@@ -30,6 +30,9 @@ class Session:
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
     last_consolidated: int = 0  # Number of messages already consolidated to files
+    # In-memory only: used for append-only save.
+    _last_saved_count: int = 0
+    _last_saved_metadata: tuple[int, str, str] | None = None  # snapshot when we last saved
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the session."""
@@ -67,6 +70,17 @@ class Session:
         self.messages = []
         self.last_consolidated = 0
         self.updated_at = datetime.now()
+        self._last_saved_count = 0
+        self._last_saved_metadata = None
+
+
+def _metadata_snapshot(session: Session) -> tuple[int, str, str]:
+    """(last_consolidated, updated_at_iso, metadata_json) for append-only save change detection."""
+    return (
+        session.last_consolidated,
+        session.updated_at.isoformat(),
+        json.dumps(session.metadata, sort_keys=True),
+    )
 
 
 class SessionManager:
@@ -92,7 +106,7 @@ class SessionManager:
         safe_key = safe_filename(key.replace(":", "_"))
         return self.legacy_sessions_dir / f"{safe_key}.jsonl"
 
-    def get_or_create(self, key: str) -> Session:
+    async def get_or_create(self, key: str) -> Session:
         """
         Get an existing session or create a new one.
 
@@ -148,41 +162,71 @@ class SessionManager:
                     else:
                         messages.append(data)
 
-            return Session(
+            s = Session(
                 key=key,
                 messages=messages,
                 created_at=created_at or datetime.now(),
                 metadata=metadata,
-                last_consolidated=last_consolidated
+                last_consolidated=last_consolidated,
             )
+            s._last_saved_count = len(messages)
+            s._last_saved_metadata = (
+                last_consolidated,
+                s.updated_at.isoformat(),
+                json.dumps(metadata, sort_keys=True),
+            )
+            return s
         except Exception as e:
             logger.warning("Failed to load session {}: {}", key, e)
             return None
 
-    def save(self, session: Session) -> None:
-        """Save a session to disk."""
+    async def save(self, session: Session) -> None:
+        """Save a session to disk. Appends only new messages when possible; full rewrite on metadata change."""
         path = self._get_session_path(session.key)
+        current_count = len(session.messages)
+        snapshot = _metadata_snapshot(session)
+        metadata_unchanged = (
+            session._last_saved_metadata is not None
+            and session._last_saved_metadata == snapshot
+        )
+        can_append = (
+            path.exists()
+            and session._last_saved_count > 0
+            and current_count >= session._last_saved_count
+            and metadata_unchanged
+        )
 
-        with open(path, "w", encoding="utf-8") as f:
-            metadata_line = {
-                "_type": "metadata",
-                "key": session.key,
-                "created_at": session.created_at.isoformat(),
-                "updated_at": session.updated_at.isoformat(),
-                "metadata": session.metadata,
-                "last_consolidated": session.last_consolidated
-            }
-            f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
-            for msg in session.messages:
-                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        if can_append and current_count > session._last_saved_count:
+            # Append only new message lines
+            with open(path, "a", encoding="utf-8") as f:
+                for msg in session.messages[session._last_saved_count:]:
+                    f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+            session._last_saved_count = current_count
+            session._last_saved_metadata = snapshot
+        elif not can_append or current_count != session._last_saved_count:
+            # Full rewrite (new file, metadata change, or messages removed)
+            with open(path, "w", encoding="utf-8") as f:
+                metadata_line = {
+                    "_type": "metadata",
+                    "key": session.key,
+                    "created_at": session.created_at.isoformat(),
+                    "updated_at": session.updated_at.isoformat(),
+                    "metadata": session.metadata,
+                    "last_consolidated": session.last_consolidated,
+                }
+                f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
+                for msg in session.messages:
+                    f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+            session._last_saved_count = current_count
+            session._last_saved_metadata = snapshot
 
         self._cache[session.key] = session
 
-    def invalidate(self, key: str) -> None:
+    async def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""
         self._cache.pop(key, None)
 
-    def list_sessions(self) -> list[dict[str, Any]]:
+    async def list_sessions(self) -> list[dict[str, Any]]:
         """
         List all sessions.
 

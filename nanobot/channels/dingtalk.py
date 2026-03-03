@@ -126,7 +126,7 @@ class DingTalkChannel(BaseChannel):
                 )
                 return
 
-            if not self.config.client_id or not self.config.client_secret:
+            if not self.config.client_id or not self.config.client_secret.get_secret_value():
                 logger.error("DingTalk client_id and client_secret not configured")
                 return
 
@@ -137,7 +137,7 @@ class DingTalkChannel(BaseChannel):
                 "Initializing DingTalk Stream Client with Client ID: {}...",
                 self.config.client_id,
             )
-            credential = Credential(self.config.client_id, self.config.client_secret)
+            credential = Credential(self.config.client_id, self.config.client_secret.get_secret_value())
             self._client = DingTalkStreamClient(credential)
 
             # Register standard handler
@@ -179,7 +179,7 @@ class DingTalkChannel(BaseChannel):
         url = "https://api.dingtalk.com/v1.0/oauth2/accessToken"
         data = {
             "appKey": self.config.client_id,
-            "appSecret": self.config.client_secret,
+            "appSecret": self.config.client_secret.get_secret_value(),
         }
 
         if not self._http:

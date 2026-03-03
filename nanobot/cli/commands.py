@@ -215,24 +215,25 @@ def _make_provider(config: Config):
     # Custom: direct OpenAI-compatible endpoint, bypasses LiteLLM
     if provider_name == "custom":
         return CustomProvider(
-            api_key=p.api_key if p else "no-key",
+            api_key=p.api_key.get_secret_value() if p else "no-key",
             api_base=config.get_api_base(model) or "http://localhost:8000/v1",
             default_model=model,
         )
 
     from nanobot.providers.registry import find_by_name
     spec = find_by_name(provider_name)
-    if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and spec.is_oauth):
+    if not model.startswith("bedrock/") and not (p and p.api_key.get_secret_value()) and not (spec and spec.is_oauth):
         console.print("[red]Error: No API key configured.[/red]")
         console.print("Set one in ~/.nanobot/config.json under providers section")
         raise typer.Exit(1)
 
     return LiteLLMProvider(
-        api_key=p.api_key if p else None,
+        api_key=p.api_key.get_secret_value() if p else None,
         api_base=config.get_api_base(model),
         default_model=model,
         extra_headers=p.extra_headers if p else None,
         provider_name=provider_name,
+        embedding_model=p.embedding_model if p else None,
     )
 
 
@@ -254,7 +255,6 @@ def gateway(
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
-    from nanobot.session.manager import SessionManager
 
     if verbose:
         import logging
@@ -266,29 +266,31 @@ def gateway(
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)
-    session_manager = SessionManager(config.workspace_path)
+
+    if config.enable_hybrid_memory:
+        console.print("[yellow]Hybrid memory enabled for gateway.[/yellow]")
 
     # Create cron service first (callback set after agent creation)
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
 
-    # Create agent with cron service
+    # AgentLoop manages its own session/memory backends based on config.enable_hybrid_memory.
     agent = AgentLoop(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
+        config=config,
         model=config.agents.defaults.model,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
         reasoning_effort=config.agents.defaults.reasoning_effort,
-        brave_api_key=config.tools.web.search.api_key or None,
+        brave_api_key=config.tools.web.search.api_key.get_secret_value() or None,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
-        session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
     )
@@ -327,11 +329,11 @@ def gateway(
     # Create channel manager
     channels = ChannelManager(config, bus)
 
-    def _pick_heartbeat_target() -> tuple[str, str]:
+    async def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages."""
         enabled = set(channels.enabled_channels)
-        # Prefer the most recently updated non-internal session on an enabled channel.
-        for item in session_manager.list_sessions():
+        # Use agent.sessions so both hybrid and file-based modes are covered.
+        for item in await agent.sessions.list_sessions():
             key = item.get("key") or ""
             if ":" not in key:
                 continue
@@ -340,13 +342,12 @@ def gateway(
                 continue
             if channel in enabled and chat_id:
                 return channel, chat_id
-        # Fallback keeps prior behavior but remains explicit.
         return "cli", "direct"
 
     # Create heartbeat service
     async def on_heartbeat_execute(tasks: str) -> str:
         """Phase 2: execute heartbeat tasks through the full agent loop."""
-        channel, chat_id = _pick_heartbeat_target()
+        channel, chat_id = await _pick_heartbeat_target()
 
         async def _silent(*_args, **_kwargs):
             pass
@@ -362,7 +363,7 @@ def gateway(
     async def on_heartbeat_notify(response: str) -> None:
         """Deliver a heartbeat response to the user's channel."""
         from nanobot.bus.events import OutboundMessage
-        channel, chat_id = _pick_heartbeat_target()
+        channel, chat_id = await _pick_heartbeat_target()
         if channel == "cli":
             return  # No external channel available to deliver to
         await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
@@ -400,10 +401,16 @@ def gateway(
         except KeyboardInterrupt:
             console.print("\nShutting down...")
         finally:
-            await agent.close_mcp()
+            try:
+                await agent.close()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                from loguru import logger
+                logger.exception("Error during gateway shutdown")
+                print("Warning: shutdown encountered an error; check logs for details.", file=sys.stderr)
             heartbeat.stop()
             cron.stop()
-            agent.stop()
             await channels.stop_all()
 
     asyncio.run(run())
@@ -437,6 +444,9 @@ def agent(
     bus = MessageBus()
     provider = _make_provider(config)
 
+    if config.enable_hybrid_memory:
+        console.print("[yellow]Hybrid memory enabled for agent command.[/yellow]")
+
     # Create cron service for tool usage (no callback needed for CLI unless running)
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
@@ -446,17 +456,19 @@ def agent(
     else:
         logger.disable("nanobot")
 
+    # AgentLoop selects session/memory backends based on config.enable_hybrid_memory.
     agent_loop = AgentLoop(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
+        config=config,
         model=config.agents.defaults.model,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
         reasoning_effort=config.agents.defaults.reasoning_effort,
-        brave_api_key=config.tools.web.search.api_key or None,
+        brave_api_key=config.tools.web.search.api_key.get_secret_value() or None,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
         cron_service=cron,
@@ -484,10 +496,18 @@ def agent(
     if message:
         # Single message mode — direct call, no bus needed
         async def run_once():
-            with _thinking_ctx():
-                response = await agent_loop.process_direct(message, session_id, on_progress=_cli_progress)
-            _print_agent_response(response, render_markdown=markdown)
-            await agent_loop.close_mcp()
+            try:
+                with _thinking_ctx():
+                    response = await agent_loop.process_direct(message, session_id, on_progress=_cli_progress)
+                _print_agent_response(response, render_markdown=markdown)
+            finally:
+                try:
+                    await agent_loop.close()
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.exception("Error during agent shutdown")
+                    print("Warning: shutdown encountered an error; check logs for details.", file=sys.stderr)
 
         asyncio.run(run_once())
     else:
@@ -504,6 +524,7 @@ def agent(
         def _exit_on_sigint(signum, frame):
             _restore_terminal()
             console.print("\nGoodbye!")
+            # asyncio.run(agent_loop.close()) # Cannot run asyncio.run from signal handler
             os._exit(0)
 
         signal.signal(signal.SIGINT, _exit_on_sigint)
@@ -579,10 +600,15 @@ def agent(
                         console.print("\nGoodbye!")
                         break
             finally:
-                agent_loop.stop()
+                try:
+                    await agent_loop.close()
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.exception("Error during agent shutdown")
+                    print("Warning: shutdown encountered an error; check logs for details.", file=sys.stderr)
                 outbound_task.cancel()
                 await asyncio.gather(bus_task, outbound_task, return_exceptions=True)
-                await agent_loop.close_mcp()
 
         asyncio.run(run_interactive())
 
@@ -643,7 +669,7 @@ def channels_status():
 
     # Telegram
     tg = config.channels.telegram
-    tg_config = f"token: {tg.token[:10]}..." if tg.token else "[dim]not configured[/dim]"
+    tg_config = f"token: {tg.token.get_secret_value()[:10]}..." if tg.token.get_secret_value() else "[dim]not configured[/dim]"
     table.add_row(
         "Telegram",
         "✓" if tg.enabled else "✗",
@@ -652,7 +678,7 @@ def channels_status():
 
     # Slack
     slack = config.channels.slack
-    slack_config = "socket" if slack.app_token and slack.bot_token else "[dim]not configured[/dim]"
+    slack_config = "socket" if slack.app_token.get_secret_value() and slack.bot_token.get_secret_value() else "[dim]not configured[/dim]"
     table.add_row(
         "Slack",
         "✓" if slack.enabled else "✗",
@@ -761,8 +787,8 @@ def channels_login():
     console.print("Scan the QR code to connect.\n")
 
     env = {**os.environ}
-    if config.channels.whatsapp.bridge_token:
-        env["BRIDGE_TOKEN"] = config.channels.whatsapp.bridge_token
+    if config.channels.whatsapp.bridge_token.get_secret_value():
+        env["BRIDGE_TOKEN"] = config.channels.whatsapp.bridge_token.get_secret_value()
 
     try:
         subprocess.run(["npm", "start"], cwd=bridge_dir, check=True, env=env)
@@ -941,26 +967,27 @@ def cron_run(
     config = load_config()
     provider = _make_provider(config)
     bus = MessageBus()
+    store_path = get_data_dir() / "cron" / "jobs.json"
+    service = CronService(store_path)
     agent_loop = AgentLoop(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
+        config=config,
         model=config.agents.defaults.model,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
         reasoning_effort=config.agents.defaults.reasoning_effort,
-        brave_api_key=config.tools.web.search.api_key or None,
+        brave_api_key=config.tools.web.search.api_key.get_secret_value() or None,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
+        cron_service=service,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
     )
-
-    store_path = get_data_dir() / "cron" / "jobs.json"
-    service = CronService(store_path)
 
     result_holder = []
 
@@ -977,7 +1004,13 @@ def cron_run(
     service.on_job = on_job
 
     async def run():
-        return await service.run_job(job_id, force=force)
+        try:
+            return await service.run_job(job_id, force=force)
+        finally:
+            try:
+                await agent_loop.close()
+            except (asyncio.CancelledError, Exception):
+                pass
 
     if asyncio.run(run()):
         console.print("[green]✓[/green] Job executed")
@@ -1025,7 +1058,7 @@ def status():
                 else:
                     console.print(f"{spec.label}: [dim]not set[/dim]")
             else:
-                has_key = bool(p.api_key)
+                has_key = bool(p.api_key.get_secret_value())
                 console.print(f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}")
 
 

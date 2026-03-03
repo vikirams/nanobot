@@ -54,6 +54,13 @@ class ReadFileTool(Tool):
             if not file_path.is_file():
                 return f"Error: Not a file: {path}"
 
+            _MAX_READ_BYTES = 5 * 1024 * 1024  # 5 MiB
+            size = file_path.stat().st_size
+            if size > _MAX_READ_BYTES:
+                return (
+                    f"Error: File too large to read ({size:,} bytes). "
+                    f"Maximum size is {_MAX_READ_BYTES:,} bytes. Use exec to process in chunks."
+                )
             content = file_path.read_text(encoding="utf-8")
             return content
         except PermissionError as e:
