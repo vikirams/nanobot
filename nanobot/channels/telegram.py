@@ -201,7 +201,7 @@ class TelegramChannel(BaseChannel):
 
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
-        if not self.config.token:
+        if not self.config.token.get_secret_value():
             logger.error("Telegram bot token not configured")
             return
 
@@ -215,7 +215,9 @@ class TelegramChannel(BaseChannel):
             read_timeout=30.0,
             proxy=self.config.proxy if self.config.proxy else None,
         )
-        builder = Application.builder().token(self.config.token).request(req).get_updates_request(req)
+        builder = Application.builder().token(self.config.token.get_secret_value()).request(req).get_updates_request(req)
+        if self.config.proxy:
+            builder = builder.proxy(self.config.proxy).get_updates_proxy(self.config.proxy)
         self._app = builder.build()
         self._app.add_error_handler(self._on_error)
 

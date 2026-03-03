@@ -69,7 +69,7 @@ class QQChannel(BaseChannel):
             logger.error("QQ SDK not installed. Run: pip install qq-botpy")
             return
 
-        if not self.config.app_id or not self.config.secret:
+        if not self.config.app_id or not self.config.secret.get_secret_value():
             logger.error("QQ app_id and secret not configured")
             return
 
@@ -83,7 +83,7 @@ class QQChannel(BaseChannel):
         """Run the bot connection with auto-reconnect."""
         while self._running:
             try:
-                await self._client.start(appid=self.config.app_id, secret=self.config.secret)
+                await self._client.start(appid=self.config.app_id, secret=self.config.secret.get_secret_value())
             except Exception as e:
                 logger.warning("QQ bot error: {}", e)
             if self._running:

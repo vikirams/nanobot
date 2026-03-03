@@ -3,7 +3,8 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic.types import SecretStr
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
@@ -19,7 +20,7 @@ class WhatsAppConfig(Base):
 
     enabled: bool = False
     bridge_url: str = "ws://localhost:3001"
-    bridge_token: str = ""  # Shared token for bridge auth (optional, recommended)
+    bridge_token: SecretStr = SecretStr("")  # Shared token for bridge auth (optional, recommended)
     allow_from: list[str] = Field(default_factory=list)  # Allowed phone numbers
 
 
@@ -27,7 +28,7 @@ class TelegramConfig(Base):
     """Telegram channel configuration."""
 
     enabled: bool = False
-    token: str = ""  # Bot token from @BotFather
+    token: SecretStr = SecretStr("")  # Bot token from @BotFather
     allow_from: list[str] = Field(default_factory=list)  # Allowed user IDs or usernames
     proxy: str | None = (
         None  # HTTP/SOCKS5 proxy URL, e.g. "http://127.0.0.1:7890" or "socks5://127.0.0.1:1080"
@@ -40,9 +41,9 @@ class FeishuConfig(Base):
 
     enabled: bool = False
     app_id: str = ""  # App ID from Feishu Open Platform
-    app_secret: str = ""  # App Secret from Feishu Open Platform
-    encrypt_key: str = ""  # Encrypt Key for event subscription (optional)
-    verification_token: str = ""  # Verification Token for event subscription (optional)
+    app_secret: SecretStr = SecretStr("")  # App Secret from Feishu Open Platform
+    encrypt_key: SecretStr = SecretStr("")  # Encrypt Key for event subscription (optional)
+    verification_token: SecretStr = SecretStr("")  # Verification Token for event subscription (optional)
     allow_from: list[str] = Field(default_factory=list)  # Allowed user open_ids
     react_emoji: str = (
         "THUMBSUP"  # Emoji type for message reactions (e.g. THUMBSUP, OK, DONE, SMILE)
@@ -54,7 +55,7 @@ class DingTalkConfig(Base):
 
     enabled: bool = False
     client_id: str = ""  # AppKey
-    client_secret: str = ""  # AppSecret
+    client_secret: SecretStr = SecretStr("")  # AppSecret
     allow_from: list[str] = Field(default_factory=list)  # Allowed staff_ids
 
 
@@ -62,7 +63,7 @@ class DiscordConfig(Base):
     """Discord channel configuration."""
 
     enabled: bool = False
-    token: str = ""  # Bot token from Discord Developer Portal
+    token: SecretStr = SecretStr("")  # Bot token from Discord Developer Portal
     allow_from: list[str] = Field(default_factory=list)  # Allowed user IDs
     gateway_url: str = "wss://gateway.discord.gg/?v=10&encoding=json"
     intents: int = 37377  # GUILDS + GUILD_MESSAGES + DIRECT_MESSAGES + MESSAGE_CONTENT
@@ -74,7 +75,7 @@ class MatrixConfig(Base):
 
     enabled: bool = False
     homeserver: str = "https://matrix.org"
-    access_token: str = ""
+    access_token: SecretStr = SecretStr("")
     user_id: str = ""  # @bot:matrix.org
     device_id: str = ""
     e2ee_enabled: bool = True  # Enable Matrix E2EE support (encryption + encrypted room handling).
@@ -100,7 +101,7 @@ class EmailConfig(Base):
     imap_host: str = ""
     imap_port: int = 993
     imap_username: str = ""
-    imap_password: str = ""
+    imap_password: SecretStr = SecretStr("")
     imap_mailbox: str = "INBOX"
     imap_use_ssl: bool = True
 
@@ -108,7 +109,7 @@ class EmailConfig(Base):
     smtp_host: str = ""
     smtp_port: int = 587
     smtp_username: str = ""
-    smtp_password: str = ""
+    smtp_password: SecretStr = SecretStr("")
     smtp_use_tls: bool = True
     smtp_use_ssl: bool = False
     from_address: str = ""
@@ -152,7 +153,7 @@ class MochatConfig(Base):
     watch_limit: int = 100
     retry_delay_ms: int = 500
     max_retry_attempts: int = 0  # 0 means unlimited retries
-    claw_token: str = ""
+    claw_token: SecretStr = SecretStr("")
     agent_user_id: str = ""
     sessions: list[str] = Field(default_factory=list)
     panels: list[str] = Field(default_factory=list)
@@ -177,8 +178,8 @@ class SlackConfig(Base):
     enabled: bool = False
     mode: str = "socket"  # "socket" supported
     webhook_path: str = "/slack/events"
-    bot_token: str = ""  # xoxb-...
-    app_token: str = ""  # xapp-...
+    bot_token: SecretStr = SecretStr("")  # xoxb-...
+    app_token: SecretStr = SecretStr("")  # xapp-...
     user_token_read_only: bool = True
     reply_in_thread: bool = True
     react_emoji: str = "eyes"
@@ -193,22 +194,30 @@ class QQConfig(Base):
 
     enabled: bool = False
     app_id: str = ""  # 机器人 ID (AppID) from q.qq.com
-    secret: str = ""  # 机器人密钥 (AppSecret) from q.qq.com
-    allow_from: list[str] = Field(
-        default_factory=list
-    )  # Allowed user openids (empty = public access)
-
-
-
+    secret: SecretStr = SecretStr("")  # 机器人密钥 (AppSecret) from q.qq.com
+    allow_from: list[str] = Field(default_factory=list)  # Allowed user openids (empty = public access)
 
 class WebUIConfig(Base):
     """Web UI channel configuration — serves an SSE endpoint for React (or any) frontends."""
 
     enabled: bool = False
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 8080
     cors_origins: list[str] = Field(default_factory=list)  # e.g. ["http://localhost:5173"]
-    api_key: str = ""  # Optional Bearer token; empty = no auth required
+    api_key: SecretStr = SecretStr("")  # Optional Bearer token; required when host is not loopback (e.g. 0.0.0.0)
+    allow_insecure_bind: bool = False  # If True, allow binding to 0.0.0.0 without api_key (e.g. Docker / internal network)
+    allow_from: list[str] = Field(default_factory=lambda: ["*"])  # Allowed sender IDs; ["*"] = allow all (default for local Web UI)
+
+    @model_validator(mode="after")
+    def require_api_key_for_non_loopback(self) -> "WebUIConfig":
+        if self.allow_insecure_bind:
+            return self
+        if self.host and self.host not in ("127.0.0.1", "localhost", "::1") and not self.api_key.get_secret_value():
+            raise ValueError(
+                "api_key is required when binding to a non-loopback address (e.g. 0.0.0.0). "
+                "Set api_key in config, use host: 127.0.0.1 for local-only access, or set allowInsecureBind: true for Docker/internal use."
+            )
+        return self
 
 
 class ChannelsConfig(Base):
@@ -242,6 +251,10 @@ class AgentDefaults(Base):
     max_tool_iterations: int = 40
     memory_window: int = 100
     reasoning_effort: str | None = None  # low / medium / high — enables LLM thinking mode
+    # Optional fast model for intent classification. If set, and if the "groq" provider
+    # is configured, a dedicated GROQ LiteLLMProvider is used for analyze_enrichment_intent
+    # to reduce latency (~9s → ~1s). Example: "moonshotai/kimi-k1.5".
+    intent_model: str | None = None
 
 
 class AgentsConfig(Base):
@@ -253,9 +266,10 @@ class AgentsConfig(Base):
 class ProviderConfig(Base):
     """LLM provider configuration."""
 
-    api_key: str = ""
+    api_key: SecretStr = SecretStr("")
     api_base: str | None = None
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
+    embedding_model: str | None = None  # Optional embedding model (e.g. "text-embedding-3-small")
 
 
 class ProvidersConfig(Base):
@@ -281,6 +295,19 @@ class ProvidersConfig(Base):
     github_copilot: ProviderConfig = Field(default_factory=ProviderConfig)  # Github Copilot (OAuth)
 
 
+class SandboxConfig(Base):
+    """Code execution sandbox configuration for analyze_discovery_data."""
+
+    provider: str = "subprocess"  # "subprocess" (default) | "inprocess"
+
+
+class TelemetryConfig(Base):
+    """Telemetry configuration."""
+
+    posthog_api_key: SecretStr = SecretStr("")
+    posthog_host: str = "https://us.i.posthog.com"
+
+
 class HeartbeatConfig(Base):
     """Heartbeat service configuration."""
 
@@ -291,7 +318,7 @@ class HeartbeatConfig(Base):
 class GatewayConfig(Base):
     """Gateway/server configuration."""
 
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 18790
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
 
@@ -299,7 +326,7 @@ class GatewayConfig(Base):
 class WebSearchConfig(Base):
     """Web search tool configuration."""
 
-    api_key: str = ""  # Brave Search API key
+    api_key: SecretStr = SecretStr("")  # Brave Search API key
     max_results: int = 5
 
 
@@ -348,6 +375,9 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
+    sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
+    enable_hybrid_memory: bool = True  # Enable SQLite + semantic hybrid memory
 
     @property
     def workspace_path(self) -> Path:
@@ -378,14 +408,14 @@ class Config(BaseSettings):
         for spec in PROVIDERS:
             p = getattr(self.providers, spec.name, None)
             if p and model_prefix and normalized_prefix == spec.name:
-                if spec.is_oauth or p.api_key:
+                if spec.is_oauth or p.api_key.get_secret_value():
                     return p, spec.name
 
         # Match by keyword (order follows PROVIDERS registry)
         for spec in PROVIDERS:
             p = getattr(self.providers, spec.name, None)
             if p and any(_kw_matches(kw) for kw in spec.keywords):
-                if spec.is_oauth or p.api_key:
+                if spec.is_oauth or p.api_key.get_secret_value():
                     return p, spec.name
 
         # Fallback: gateways first, then others (follows registry order)
@@ -394,7 +424,7 @@ class Config(BaseSettings):
             if spec.is_oauth:
                 continue
             p = getattr(self.providers, spec.name, None)
-            if p and p.api_key:
+            if p and p.api_key.get_secret_value():
                 return p, spec.name
         return None, None
 
@@ -411,7 +441,7 @@ class Config(BaseSettings):
     def get_api_key(self, model: str | None = None) -> str | None:
         """Get API key for the given model. Falls back to first available key."""
         p = self.get_provider(model)
-        return p.api_key if p else None
+        return p.api_key.get_secret_value() if p else None
 
     def get_api_base(self, model: str | None = None) -> str | None:
         """Get API base URL for the given model. Applies default URLs for known gateways."""

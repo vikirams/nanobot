@@ -4,11 +4,11 @@ import hashlib
 import os
 import secrets
 import string
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import json_repair
 import litellm
-from litellm import acompletion
+from litellm import acompletion, aembedding
 from loguru import logger
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
@@ -40,10 +40,13 @@ class LiteLLMProvider(LLMProvider):
         default_model: str = "anthropic/claude-opus-4-5",
         extra_headers: dict[str, str] | None = None,
         provider_name: str | None = None,
+        embedding_model: str | None = None,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
         self.extra_headers = extra_headers or {}
+
+        self._embedding_model = embedding_model
 
         # Detect gateway / local deployment.
         # provider_name (from config key) is the primary signal;
@@ -214,6 +217,7 @@ class LiteLLMProvider(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
+        on_token: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         """
         Send a chat completion request via LiteLLM.
@@ -224,6 +228,10 @@ class LiteLLMProvider(LLMProvider):
             model: Model identifier (e.g., 'anthropic/claude-sonnet-4-5').
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
+            reasoning_effort: Optional reasoning effort (e.g. low/medium/high) for thinking models.
+            on_token: Optional async callback for streamed text tokens.
+                      When provided, streaming is enabled and on_token(delta) is
+                      called for each content chunk as it arrives.
 
         Returns:
             LLMResponse with content and/or tool calls.
@@ -260,24 +268,64 @@ class LiteLLMProvider(LLMProvider):
         # Pass extra headers (e.g. APP-Code for AiHubMix)
         if self.extra_headers:
             kwargs["extra_headers"] = self.extra_headers
-        
+
         if reasoning_effort:
             kwargs["reasoning_effort"] = reasoning_effort
             kwargs["drop_params"] = True
-        
+
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
 
         try:
+            # Streaming path: when on_token is provided, stream content deltas then
+            # reconstruct full response from chunks (including tool_calls) for parsing.
+            if on_token:
+                return await self._chat_streaming(kwargs, on_token)
+
             response = await acompletion(**kwargs)
             return self._parse_response(response)
         except Exception as e:
-            # Return error as content for graceful handling
+            logger.exception("LLM call failed")
             return LLMResponse(
-                content=f"Error calling LLM: {str(e)}",
+                content="Error calling LLM. Please try again or check your provider configuration.",
                 finish_reason="error",
             )
+
+    async def _chat_streaming(
+        self,
+        kwargs: dict[str, Any],
+        on_token: Callable[[str], Awaitable[None]],
+    ) -> LLMResponse:
+        """Stream the response, calling on_token for each chunk, then return full LLMResponse."""
+        stream_kwargs = {**kwargs, "stream": True}
+        chunks: list[Any] = []
+        collected_content = ""
+
+        try:
+            response = await acompletion(**stream_kwargs)
+            async for chunk in response:
+                chunks.append(chunk)
+                delta = (
+                    chunk.choices[0].delta.content
+                    if chunk.choices and chunk.choices[0].delta
+                    else None
+                )
+                if delta:
+                    collected_content += delta
+                    await on_token(delta)
+        except Exception:
+            # Fall back to non-streaming if streaming fails
+            response = await acompletion(**{k: v for k, v in stream_kwargs.items() if k != "stream"})
+            return self._parse_response(response)
+
+        # Reconstruct the full response from chunks for tool_call / usage extraction
+        try:
+            full_response = litellm.stream_chunk_builder(chunks, messages=kwargs.get("messages"))
+            return self._parse_response(full_response)
+        except Exception:
+            # Fallback: build a minimal LLMResponse from collected text
+            return LLMResponse(content=collected_content or None, finish_reason="stop")
 
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""
@@ -338,3 +386,18 @@ class LiteLLMProvider(LLMProvider):
     def get_default_model(self) -> str:
         """Get the default model."""
         return self.default_model
+
+    def get_embedding_model(self) -> str | None:
+        """Return the configured embedding model, or None if not set."""
+        return self._embedding_model
+
+    async def embed(self, input: list[str], model: str, **kwargs: Any) -> Any:
+        """Generate embeddings via LiteLLM's aembedding."""
+        embed_kwargs: dict[str, Any] = {"model": model, "input": input}
+        if self.api_key:
+            embed_kwargs["api_key"] = self.api_key
+        if self.api_base:
+            embed_kwargs["api_base"] = self.api_base
+        if self.extra_headers:
+            embed_kwargs["extra_headers"] = self.extra_headers
+        return await aembedding(**embed_kwargs)

@@ -250,7 +250,7 @@ class MochatChannel(BaseChannel):
 
     async def start(self) -> None:
         """Start Mochat channel workers and websocket connection."""
-        if not self.config.claw_token:
+        if not self.config.claw_token.get_secret_value():
             logger.error("Mochat claw_token not configured")
             return
 
@@ -402,7 +402,7 @@ class MochatChannel(BaseChannel):
             self._socket = client
             await client.connect(
                 socket_url, transports=["websocket"], socketio_path=socket_path,
-                auth={"token": self.config.claw_token},
+                auth={"token": self.config.claw_token.get_secret_value()},
                 wait_timeout=max(1.0, self.config.socket_connect_timeout_ms / 1000.0),
             )
             return True
@@ -861,7 +861,7 @@ class MochatChannel(BaseChannel):
             raise RuntimeError("Mochat HTTP client not initialized")
         url = f"{self.config.base_url.strip().rstrip('/')}{path}"
         response = await self._http.post(url, headers={
-            "Content-Type": "application/json", "X-Claw-Token": self.config.claw_token,
+            "Content-Type": "application/json", "X-Claw-Token": self.config.claw_token.get_secret_value(),
         }, json=payload)
         if not response.is_success:
             raise RuntimeError(f"Mochat HTTP {response.status_code}: {response.text[:200]}")

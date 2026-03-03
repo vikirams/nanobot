@@ -228,7 +228,7 @@ def _make_provider(config: Config):
     from nanobot.providers.custom_provider import CustomProvider
     if provider_name == "custom":
         return CustomProvider(
-            api_key=p.api_key if p else "no-key",
+            api_key=p.api_key.get_secret_value() if p else "no-key",
             api_base=config.get_api_base(model) or "http://localhost:8000/v1",
             default_model=model,
         )
@@ -250,17 +250,18 @@ def _make_provider(config: Config):
     from nanobot.providers.litellm_provider import LiteLLMProvider
     from nanobot.providers.registry import find_by_name
     spec = find_by_name(provider_name)
-    if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and spec.is_oauth):
+    if not model.startswith("bedrock/") and not (p and p.api_key.get_secret_value()) and not (spec and spec.is_oauth):
         console.print("[red]Error: No API key configured.[/red]")
         console.print("Set one in ~/.nanobot/config.json under providers section")
         raise typer.Exit(1)
 
     return LiteLLMProvider(
-        api_key=p.api_key if p else None,
+        api_key=p.api_key.get_secret_value() if p else None,
         api_base=config.get_api_base(model),
         default_model=model,
         extra_headers=p.extra_headers if p else None,
         provider_name=provider_name,
+        embedding_model=p.embedding_model if p else None,
     )
 
 
@@ -303,7 +304,6 @@ def gateway(
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
-    from nanobot.session.manager import SessionManager
 
     if verbose:
         import logging
@@ -315,29 +315,31 @@ def gateway(
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)
-    session_manager = SessionManager(config.workspace_path)
+
+    if config.enable_hybrid_memory:
+        console.print("[yellow]Hybrid memory enabled for gateway.[/yellow]")
 
     # Create cron service first (callback set after agent creation)
     cron_store_path = get_cron_dir() / "jobs.json"
     cron = CronService(cron_store_path)
 
-    # Create agent with cron service
+    # AgentLoop manages its own session/memory backends based on config.enable_hybrid_memory.
     agent = AgentLoop(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
+        config=config,
         model=config.agents.defaults.model,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
         reasoning_effort=config.agents.defaults.reasoning_effort,
-        brave_api_key=config.tools.web.search.api_key or None,
+        brave_api_key=config.tools.web.search.api_key.get_secret_value() or None,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
-        session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
     )
@@ -386,11 +388,11 @@ def gateway(
     # Create channel manager
     channels = ChannelManager(config, bus)
 
-    def _pick_heartbeat_target() -> tuple[str, str]:
+    async def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages."""
         enabled = set(channels.enabled_channels)
-        # Prefer the most recently updated non-internal session on an enabled channel.
-        for item in session_manager.list_sessions():
+        # Use agent.sessions so both hybrid and file-based modes are covered.
+        for item in await agent.sessions.list_sessions():
             key = item.get("key") or ""
             if ":" not in key:
                 continue
@@ -399,13 +401,12 @@ def gateway(
                 continue
             if channel in enabled and chat_id:
                 return channel, chat_id
-        # Fallback keeps prior behavior but remains explicit.
         return "cli", "direct"
 
     # Create heartbeat service
     async def on_heartbeat_execute(tasks: str) -> str:
         """Phase 2: execute heartbeat tasks through the full agent loop."""
-        channel, chat_id = _pick_heartbeat_target()
+        channel, chat_id = await _pick_heartbeat_target()
 
         async def _silent(*_args, **_kwargs):
             pass
@@ -421,7 +422,7 @@ def gateway(
     async def on_heartbeat_notify(response: str) -> None:
         """Deliver a heartbeat response to the user's channel."""
         from nanobot.bus.events import OutboundMessage
-        channel, chat_id = _pick_heartbeat_target()
+        channel, chat_id = await _pick_heartbeat_target()
         if channel == "cli":
             return  # No external channel available to deliver to
         await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
@@ -459,10 +460,16 @@ def gateway(
         except KeyboardInterrupt:
             console.print("\nShutting down...")
         finally:
-            await agent.close_mcp()
+            try:
+                await agent.close()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                from loguru import logger
+                logger.exception("Error during gateway shutdown")
+                print("Warning: shutdown encountered an error; check logs for details.", file=sys.stderr)
             heartbeat.stop()
             cron.stop()
-            agent.stop()
             await channels.stop_all()
 
     asyncio.run(run())
@@ -498,6 +505,9 @@ def agent(
     bus = MessageBus()
     provider = _make_provider(config)
 
+    if config.enable_hybrid_memory:
+        console.print("[yellow]Hybrid memory enabled for agent command.[/yellow]")
+
     # Create cron service for tool usage (no callback needed for CLI unless running)
     cron_store_path = get_cron_dir() / "jobs.json"
     cron = CronService(cron_store_path)
@@ -507,17 +517,19 @@ def agent(
     else:
         logger.disable("nanobot")
 
+    # AgentLoop selects session/memory backends based on config.enable_hybrid_memory.
     agent_loop = AgentLoop(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
+        config=config,
         model=config.agents.defaults.model,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
         reasoning_effort=config.agents.defaults.reasoning_effort,
-        brave_api_key=config.tools.web.search.api_key or None,
+        brave_api_key=config.tools.web.search.api_key.get_secret_value() or None,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
         cron_service=cron,
@@ -545,10 +557,18 @@ def agent(
     if message:
         # Single message mode — direct call, no bus needed
         async def run_once():
-            with _thinking_ctx():
-                response = await agent_loop.process_direct(message, session_id, on_progress=_cli_progress)
-            _print_agent_response(response, render_markdown=markdown)
-            await agent_loop.close_mcp()
+            try:
+                with _thinking_ctx():
+                    response = await agent_loop.process_direct(message, session_id, on_progress=_cli_progress)
+                _print_agent_response(response, render_markdown=markdown)
+            finally:
+                try:
+                    await agent_loop.close()
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.exception("Error during agent shutdown")
+                    print("Warning: shutdown encountered an error; check logs for details.", file=sys.stderr)
 
         asyncio.run(run_once())
     else:
@@ -566,7 +586,7 @@ def agent(
             sig_name = signal.Signals(signum).name
             _restore_terminal()
             console.print(f"\nReceived {sig_name}, goodbye!")
-            sys.exit(0)
+            os._exit(0)
 
         signal.signal(signal.SIGINT, _handle_signal)
         signal.signal(signal.SIGTERM, _handle_signal)
@@ -649,10 +669,15 @@ def agent(
                         console.print("\nGoodbye!")
                         break
             finally:
-                agent_loop.stop()
+                try:
+                    await agent_loop.close()
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.exception("Error during agent shutdown")
+                    print("Warning: shutdown encountered an error; check logs for details.", file=sys.stderr)
                 outbound_task.cancel()
                 await asyncio.gather(bus_task, outbound_task, return_exceptions=True)
-                await agent_loop.close_mcp()
 
         asyncio.run(run_interactive())
 
@@ -713,7 +738,7 @@ def channels_status():
 
     # Telegram
     tg = config.channels.telegram
-    tg_config = f"token: {tg.token[:10]}..." if tg.token else "[dim]not configured[/dim]"
+    tg_config = f"token: {tg.token.get_secret_value()[:10]}..." if tg.token.get_secret_value() else "[dim]not configured[/dim]"
     table.add_row(
         "Telegram",
         "✓" if tg.enabled else "✗",
@@ -722,7 +747,7 @@ def channels_status():
 
     # Slack
     slack = config.channels.slack
-    slack_config = "socket" if slack.app_token and slack.bot_token else "[dim]not configured[/dim]"
+    slack_config = "socket" if slack.app_token.get_secret_value() and slack.bot_token.get_secret_value() else "[dim]not configured[/dim]"
     table.add_row(
         "Slack",
         "✓" if slack.enabled else "✗",
@@ -834,8 +859,8 @@ def channels_login():
     console.print("Scan the QR code to connect.\n")
 
     env = {**os.environ}
-    if config.channels.whatsapp.bridge_token:
-        env["BRIDGE_TOKEN"] = config.channels.whatsapp.bridge_token
+    if config.channels.whatsapp.bridge_token.get_secret_value():
+        env["BRIDGE_TOKEN"] = config.channels.whatsapp.bridge_token.get_secret_value()
     env["AUTH_DIR"] = str(get_runtime_subdir("whatsapp-auth"))
 
     try:
@@ -844,6 +869,228 @@ def channels_login():
         console.print(f"[red]Bridge failed: {e}[/red]")
     except FileNotFoundError:
         console.print("[red]npm not found. Please install Node.js.[/red]")
+
+
+# ============================================================================
+# Cron Commands
+# ============================================================================
+
+cron_app = typer.Typer(help="Manage scheduled tasks")
+app.add_typer(cron_app, name="cron")
+
+
+@cron_app.command("list")
+def cron_list(
+    all: bool = typer.Option(False, "--all", "-a", help="Include disabled jobs"),
+):
+    """List scheduled jobs."""
+    from nanobot.config.loader import get_data_dir
+    from nanobot.cron.service import CronService
+
+    store_path = get_data_dir() / "cron" / "jobs.json"
+    service = CronService(store_path)
+
+    jobs = service.list_jobs(include_disabled=all)
+
+    if not jobs:
+        console.print("No scheduled jobs.")
+        return
+
+    table = Table(title="Scheduled Jobs")
+    table.add_column("ID", style="cyan")
+    table.add_column("Name")
+    table.add_column("Schedule")
+    table.add_column("Status")
+    table.add_column("Next Run")
+
+    import time
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+    for job in jobs:
+        # Format schedule
+        if job.schedule.kind == "every":
+            sched = f"every {(job.schedule.every_ms or 0) // 1000}s"
+        elif job.schedule.kind == "cron":
+            sched = f"{job.schedule.expr or ''} ({job.schedule.tz})" if job.schedule.tz else (job.schedule.expr or "")
+        else:
+            sched = "one-time"
+
+        # Format next run
+        next_run = ""
+        if job.state.next_run_at_ms:
+            ts = job.state.next_run_at_ms / 1000
+            try:
+                tz = ZoneInfo(job.schedule.tz) if job.schedule.tz else None
+                next_run = _dt.fromtimestamp(ts, tz).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                next_run = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+        status = "[green]enabled[/green]" if job.enabled else "[dim]disabled[/dim]"
+
+        table.add_row(job.id, job.name, sched, status, next_run)
+
+    console.print(table)
+
+
+@cron_app.command("add")
+def cron_add(
+    name: str = typer.Option(..., "--name", "-n", help="Job name"),
+    message: str = typer.Option(..., "--message", "-m", help="Message for agent"),
+    every: int = typer.Option(None, "--every", "-e", help="Run every N seconds"),
+    cron_expr: str = typer.Option(None, "--cron", "-c", help="Cron expression (e.g. '0 9 * * *')"),
+    tz: str | None = typer.Option(None, "--tz", help="IANA timezone for cron (e.g. 'America/Vancouver')"),
+    at: str = typer.Option(None, "--at", help="Run once at time (ISO format)"),
+    deliver: bool = typer.Option(False, "--deliver", "-d", help="Deliver response to channel"),
+    to: str = typer.Option(None, "--to", help="Recipient for delivery"),
+    channel: str = typer.Option(None, "--channel", help="Channel for delivery (e.g. 'telegram', 'whatsapp')"),
+):
+    """Add a scheduled job."""
+    from nanobot.config.loader import get_data_dir
+    from nanobot.cron.service import CronService
+    from nanobot.cron.types import CronSchedule
+
+    if tz and not cron_expr:
+        console.print("[red]Error: --tz can only be used with --cron[/red]")
+        raise typer.Exit(1)
+
+    # Determine schedule type
+    if every:
+        schedule = CronSchedule(kind="every", every_ms=every * 1000)
+    elif cron_expr:
+        schedule = CronSchedule(kind="cron", expr=cron_expr, tz=tz)
+    elif at:
+        import datetime
+        dt = datetime.datetime.fromisoformat(at)
+        schedule = CronSchedule(kind="at", at_ms=int(dt.timestamp() * 1000))
+    else:
+        console.print("[red]Error: Must specify --every, --cron, or --at[/red]")
+        raise typer.Exit(1)
+
+    store_path = get_data_dir() / "cron" / "jobs.json"
+    service = CronService(store_path)
+
+    try:
+        job = service.add_job(
+            name=name,
+            schedule=schedule,
+            message=message,
+            deliver=deliver,
+            to=to,
+            channel=channel,
+        )
+    except ValueError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1) from e
+
+    console.print(f"[green]✓[/green] Added job '{job.name}' ({job.id})")
+
+
+@cron_app.command("remove")
+def cron_remove(
+    job_id: str = typer.Argument(..., help="Job ID to remove"),
+):
+    """Remove a scheduled job."""
+    from nanobot.config.loader import get_data_dir
+    from nanobot.cron.service import CronService
+
+    store_path = get_data_dir() / "cron" / "jobs.json"
+    service = CronService(store_path)
+
+    if service.remove_job(job_id):
+        console.print(f"[green]✓[/green] Removed job {job_id}")
+    else:
+        console.print(f"[red]Job {job_id} not found[/red]")
+
+
+@cron_app.command("enable")
+def cron_enable(
+    job_id: str = typer.Argument(..., help="Job ID"),
+    disable: bool = typer.Option(False, "--disable", help="Disable instead of enable"),
+):
+    """Enable or disable a job."""
+    from nanobot.config.loader import get_data_dir
+    from nanobot.cron.service import CronService
+
+    store_path = get_data_dir() / "cron" / "jobs.json"
+    service = CronService(store_path)
+
+    job = service.enable_job(job_id, enabled=not disable)
+    if job:
+        status = "disabled" if disable else "enabled"
+        console.print(f"[green]✓[/green] Job '{job.name}' {status}")
+    else:
+        console.print(f"[red]Job {job_id} not found[/red]")
+
+
+@cron_app.command("run")
+def cron_run(
+    job_id: str = typer.Argument(..., help="Job ID to run"),
+    force: bool = typer.Option(False, "--force", "-f", help="Run even if disabled"),
+):
+    """Manually run a job."""
+    from loguru import logger
+
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.queue import MessageBus
+    from nanobot.config.loader import get_data_dir, load_config
+    from nanobot.cron.service import CronService
+    from nanobot.cron.types import CronJob
+    logger.disable("nanobot")
+
+    config = load_config()
+    provider = _make_provider(config)
+    bus = MessageBus()
+    store_path = get_data_dir() / "cron" / "jobs.json"
+    service = CronService(store_path)
+    agent_loop = AgentLoop(
+        bus=bus,
+        provider=provider,
+        workspace=config.workspace_path,
+        config=config,
+        model=config.agents.defaults.model,
+        temperature=config.agents.defaults.temperature,
+        max_tokens=config.agents.defaults.max_tokens,
+        max_iterations=config.agents.defaults.max_tool_iterations,
+        memory_window=config.agents.defaults.memory_window,
+        reasoning_effort=config.agents.defaults.reasoning_effort,
+        brave_api_key=config.tools.web.search.api_key.get_secret_value() or None,
+        web_proxy=config.tools.web.proxy or None,
+        exec_config=config.tools.exec,
+        cron_service=service,
+        restrict_to_workspace=config.tools.restrict_to_workspace,
+        mcp_servers=config.tools.mcp_servers,
+        channels_config=config.channels,
+    )
+
+    result_holder = []
+
+    async def on_job(job: CronJob) -> str | None:
+        response = await agent_loop.process_direct(
+            job.payload.message,
+            session_key=f"cron:{job.id}",
+            channel=job.payload.channel or "cli",
+            chat_id=job.payload.to or "direct",
+        )
+        result_holder.append(response)
+        return response
+
+    service.on_job = on_job
+
+    async def run():
+        try:
+            return await service.run_job(job_id, force=force)
+        finally:
+            try:
+                await agent_loop.close()
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    if asyncio.run(run()):
+        console.print("[green]✓[/green] Job executed")
+        if result_holder:
+            _print_agent_response(result_holder[0], render_markdown=True)
+    else:
+        console.print(f"[red]Failed to run job {job_id}[/red]")
 
 
 # ============================================================================
@@ -884,7 +1131,7 @@ def status():
                 else:
                     console.print(f"{spec.label}: [dim]not set[/dim]")
             else:
-                has_key = bool(p.api_key)
+                has_key = bool(p.api_key.get_secret_value())
                 console.print(f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}")
 
 

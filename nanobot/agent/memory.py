@@ -62,7 +62,15 @@ class MemoryStore:
         with open(self.history_file, "a", encoding="utf-8") as f:
             f.write(entry.rstrip() + "\n\n")
 
-    def get_memory_context(self) -> str:
+    async def get_memory_context(
+        self, session_id: str = "", query: str = "", workspace_key: str = ""
+    ) -> str:
+        """Return memory context string.
+
+        session_id, query, and workspace_key are ignored by the file-based store
+        (the workspace MEMORY.md is always the source) but are part of the shared
+        interface consumed by HybridMemoryStore.
+        """
         long_term = self.read_long_term()
         return f"## Long-term Memory\n{long_term}" if long_term else ""
 
@@ -98,8 +106,7 @@ class MemoryStore:
         for m in old_messages:
             if not m.get("content"):
                 continue
-            tools = f" [tools: {', '.join(m['tools_used'])}]" if m.get("tools_used") else ""
-            lines.append(f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}")
+            lines.append(f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}: {m['content']}")
 
         current_memory = self.read_long_term()
         prompt = f"""Process this conversation and call the save_memory tool with your consolidation.

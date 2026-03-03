@@ -267,7 +267,7 @@ class FeishuChannel(BaseChannel):
             logger.error("Feishu SDK not installed. Run: pip install lark-oapi")
             return
 
-        if not self.config.app_id or not self.config.app_secret:
+        if not self.config.app_id or not self.config.app_secret.get_secret_value():
             logger.error("Feishu app_id and app_secret not configured")
             return
 
@@ -278,12 +278,13 @@ class FeishuChannel(BaseChannel):
         # Create Lark client for sending messages
         self._client = lark.Client.builder() \
             .app_id(self.config.app_id) \
-            .app_secret(self.config.app_secret) \
+            .app_secret(self.config.app_secret.get_secret_value()) \
             .log_level(lark.LogLevel.INFO) \
             .build()
+        # Create event handler (only register message receive, ignore other events)
         builder = lark.EventDispatcherHandler.builder(
-            self.config.encrypt_key or "",
-            self.config.verification_token or "",
+            self.config.encrypt_key.get_secret_value() or "",
+            self.config.verification_token.get_secret_value() or "",
         ).register_p2_im_message_receive_v1(
             self._on_message_sync
         )
@@ -303,7 +304,7 @@ class FeishuChannel(BaseChannel):
         # Create WebSocket client for long connection
         self._ws_client = lark.ws.Client(
             self.config.app_id,
-            self.config.app_secret,
+            self.config.app_secret.get_secret_value(),
             event_handler=event_handler,
             log_level=lark.LogLevel.INFO
         )

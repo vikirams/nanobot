@@ -151,11 +151,13 @@ class SubagentManager:
                         "tool_calls": tool_call_dicts,
                     })
 
-                    # Execute tools
+                    _TOOL_RESULT_MAX_CHARS = 500
                     for tool_call in response.tool_calls:
                         args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                         logger.debug("Subagent [{}] executing: {} with arguments: {}", task_id, tool_call.name, args_str)
                         result = await tools.execute(tool_call.name, tool_call.arguments)
+                        if len(result) > _TOOL_RESULT_MAX_CHARS:
+                            result = result[: _TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call.id,

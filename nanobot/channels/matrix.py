@@ -172,7 +172,7 @@ class MatrixChannel(BaseChannel):
             config=AsyncClientConfig(store_sync_tokens=True, encryption_enabled=self.config.e2ee_enabled),
         )
         self.client.user_id = self.config.user_id
-        self.client.access_token = self.config.access_token
+        self.client.access_token = self.config.access_token.get_secret_value()
         self.client.device_id = self.config.device_id
 
         self._register_event_callbacks()

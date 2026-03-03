@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 
 @dataclass
@@ -110,17 +110,21 @@ class LLMProvider(ABC):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
+        on_token: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         """
         Send a chat completion request.
-        
+
         Args:
             messages: List of message dicts with 'role' and 'content'.
             tools: Optional list of tool definitions.
             model: Model identifier (provider-specific).
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
-        
+            on_token: Optional async callback called with each streamed text token.
+                      When provided, the provider streams the response and calls
+                      on_token(delta) for each content chunk received.
+
         Returns:
             LLMResponse with content and/or tool calls.
         """
@@ -130,3 +134,21 @@ class LLMProvider(ABC):
     def get_default_model(self) -> str:
         """Get the default model for this provider."""
         pass
+
+    def get_embedding_model(self) -> str | None:
+        """Return the embedding model name to use for semantic memory, or None to disable.
+
+        Override in provider subclasses that support embeddings.
+        """
+        return None
+
+    async def embed(self, input: list[str], model: str, **kwargs: Any) -> Any:
+        """Generate embeddings for the given input texts.
+
+        Raises NotImplementedError if the provider does not support embeddings.
+        Override in subclasses that have embedding support.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support embeddings. "
+            "Override embed() or set get_embedding_model() to None to disable semantic memory."
+        )

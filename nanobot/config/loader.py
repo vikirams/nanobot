@@ -43,7 +43,7 @@ def load_config(config_path: Path | None = None) -> Config:
             return Config.model_validate(data)
         except (json.JSONDecodeError, ValueError) as e:
             print(f"Warning: Failed to load config from {path}: {e}")
-            print("Using default configuration.")
+            print("Using default configuration (e.g. no API keys or channel settings from file).")
 
     return Config()
 

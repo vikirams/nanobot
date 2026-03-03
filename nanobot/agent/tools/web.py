@@ -11,6 +11,7 @@ import httpx
 from loguru import logger
 
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.url_validation import validate_not_private
 
 # Shared constants
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36"
@@ -132,6 +133,9 @@ class WebFetchTool(Tool):
         is_valid, error_msg = _validate_url(url)
         if not is_valid:
             return json.dumps({"error": f"URL validation failed: {error_msg}", "url": url}, ensure_ascii=False)
+        allowed, ssrf_msg = validate_not_private(url)
+        if not allowed:
+            return json.dumps({"error": f"URL not allowed: {ssrf_msg}", "url": url}, ensure_ascii=False)
 
         try:
             logger.debug("WebFetch: {}", "proxy enabled" if self.proxy else "direct connection")
