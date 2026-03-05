@@ -500,6 +500,16 @@ class SqliteManager:
         row = await cursor.fetchone()
         return row[0] if row else None
 
+    async def delete_expired_mcp_cache(self) -> int:
+        """Remove expired MCP cache rows. Returns number of rows deleted. Call opportunistically to avoid unbounded growth."""
+        conn = await self._get_conn()
+        cursor = await conn.execute(
+            "DELETE FROM mcp_cache WHERE expires_at <= CURRENT_TIMESTAMP",
+        )
+        deleted = cursor.rowcount
+        await conn.commit()
+        return deleted
+
     async def set_mcp_cache(
         self,
         cache_key: str,
@@ -532,6 +542,13 @@ class SqliteManager:
             (cache_key, tool_name, params_json, result_json, row_count, str(ttl_hours)),
         )
         await conn.commit()
+        # Opportunistic cleanup: remove expired rows so the table does not grow unbounded
+        try:
+            deleted = await self.delete_expired_mcp_cache()
+            if deleted > 0:
+                logger.debug("MCP cache: removed {} expired row(s)", deleted)
+        except Exception as _e:
+            logger.warning("MCP cache cleanup failed: {}", _e)
 
     # ── Cross-session canonical entities ─────────────────────────────────────
 

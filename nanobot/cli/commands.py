@@ -391,16 +391,31 @@ def gateway(
     console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
 
     async def run():
+        main_task: asyncio.Task | None = None
+
+        def _request_shutdown():
+            if main_task and not main_task.done():
+                main_task.cancel()
+
+        loop = asyncio.get_running_loop()
+        # SIGTERM (docker stop / kill -15) → cancel main tasks → finally block flushes zvec
+        try:
+            loop.add_signal_handler(signal.SIGTERM, _request_shutdown)
+        except NotImplementedError:
+            pass  # Windows — signal handler not supported on ProactorEventLoop
+
         try:
             await cron.start()
             await heartbeat.start()
-            await asyncio.gather(
+            main_task = asyncio.ensure_future(asyncio.gather(
                 agent.run(),
                 channels.start_all(),
-            )
-        except KeyboardInterrupt:
-            console.print("\nShutting down...")
+            ))
+            await main_task
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            pass
         finally:
+            console.print("\nShutting down gracefully…")
             try:
                 await agent.close()
             except asyncio.CancelledError:
@@ -521,15 +536,24 @@ def agent(
         else:
             cli_channel, cli_chat_id = "cli", session_id
 
-        def _exit_on_sigint(signum, frame):
-            _restore_terminal()
-            console.print("\nGoodbye!")
-            # asyncio.run(agent_loop.close()) # Cannot run asyncio.run from signal handler
-            os._exit(0)
-
-        signal.signal(signal.SIGINT, _exit_on_sigint)
-
         async def run_interactive():
+            loop = asyncio.get_running_loop()
+            shutdown_requested = False
+
+            def _request_shutdown():
+                nonlocal shutdown_requested
+                shutdown_requested = True
+                # Unblock any pending turn_done.wait() so the main loop can exit.
+                turn_done.set()
+
+            # SIGTERM (docker stop) and SIGINT (Ctrl+C) both trigger graceful shutdown
+            # so agent_loop.close() → zvec.close() runs in the finally block.
+            try:
+                loop.add_signal_handler(signal.SIGTERM, _request_shutdown)
+                loop.add_signal_handler(signal.SIGINT, _request_shutdown)
+            except NotImplementedError:
+                pass  # Windows
+
             bus_task = asyncio.create_task(agent_loop.run())
             turn_done = asyncio.Event()
             turn_done.set()
@@ -563,7 +587,7 @@ def agent(
             outbound_task = asyncio.create_task(_consume_outbound())
 
             try:
-                while True:
+                while not shutdown_requested:
                     try:
                         _flush_pending_tty_input()
                         user_input = await _read_interactive_input_async()
@@ -572,7 +596,6 @@ def agent(
                             continue
 
                         if _is_exit_command(command):
-                            _restore_terminal()
                             console.print("\nGoodbye!")
                             break
 
@@ -589,17 +612,20 @@ def agent(
                         with _thinking_ctx():
                             await turn_done.wait()
 
+                        if shutdown_requested:
+                            break
+
                         if turn_response:
                             _print_agent_response(turn_response[0], render_markdown=markdown)
                     except KeyboardInterrupt:
-                        _restore_terminal()
                         console.print("\nGoodbye!")
                         break
                     except EOFError:
-                        _restore_terminal()
                         console.print("\nGoodbye!")
                         break
             finally:
+                _restore_terminal()
+                console.print("Flushing memory…")
                 try:
                     await agent_loop.close()
                 except asyncio.CancelledError:

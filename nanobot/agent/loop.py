@@ -56,6 +56,18 @@ if TYPE_CHECKING:
     from nanobot.config.schema import ChannelsConfig
     from nanobot.cron.service import CronService
 
+# Tools whose results are metadata/summaries — never store as discovery results.
+_EAGER_STORE_EXEMPT: frozenset[str] = frozenset({
+    "analyze_enrichment_intent",
+    "list_discovery_results",
+    "get_discovery_data",
+    "deduplicate_results",
+    "export_discovery_to_csv",
+    "push_to_webhook",
+    "save_csv",
+    "analyze_discovery_data",
+})
+
 
 def _compact_tabular_result(result_str: str, max_preview_rows: int = 20, parsed: Any = None) -> str:
     """Compact a large tabular JSON tool result for in-loop context.
@@ -346,6 +358,25 @@ class AgentLoop:
             await self._mcp_stack.__aenter__()
             await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
             self._mcp_connected = True
+        except asyncio.CancelledError:
+            # CancelledError is BaseException in Python 3.8+ and is NOT caught by
+            # `except Exception`. The MCP transport layer (e.g. streamable_http_client)
+            # can raise CancelledError internally during connection setup, which would
+            # propagate uncaught and crash agent.run().
+            # Only re-raise if this task was actually cancelled (e.g. via SIGTERM);
+            # otherwise treat it as a transient connection failure and retry later.
+            task = asyncio.current_task()
+            if task is not None and task.cancelling() > 0:
+                # Real task cancellation — skip await-based cleanup to avoid masking it.
+                self._mcp_stack = None
+                raise
+            logger.warning("MCP connection interrupted (spurious CancelledError from transport layer); will retry on next message")
+            if self._mcp_stack:
+                try:
+                    await self._mcp_stack.aclose()
+                except Exception:
+                    pass
+                self._mcp_stack = None
         except Exception as e:
             logger.error("Failed to connect MCP servers (will retry next message): {}", e)
             if self._mcp_stack:
@@ -414,8 +445,8 @@ class AgentLoop:
         session_key: str = "",
         account_id: str = "",
         sqlite_mgr: "SqliteManager | None" = None,
-    ) -> tuple[str | None, list[str], list[dict], dict[str, str]]:
-        """Run the agent iteration loop. Returns (final_content, tools_used, messages, raw_payloads)."""
+    ) -> tuple[str | None, list[str], list[dict], dict[str, str], set[str]]:
+        """Run the agent iteration loop. Returns (final_content, tools_used, messages, raw_payloads, eagerly_stored_ids)."""
         messages = initial_messages
         iteration = 0
         final_content = None
@@ -426,6 +457,9 @@ class AgentLoop:
         # Full (uncompacted) payloads keyed by tool_call_id — passed to _save_turn
         # so SQLite always stores the complete dataset, not the in-loop compacted preview.
         raw_payloads: dict[str, str] = {}
+        # tool_call_ids already persisted to discovery_results in this loop iteration,
+        # so _save_turn can skip them and avoid duplicates.
+        eagerly_stored_ids: set[str] = set()
 
         # Sliding window of recent tool signatures for duplicate detection.
         # Signature = tool_name + stable hash of arguments (catches identical repeated calls).
@@ -521,6 +555,17 @@ class AgentLoop:
                     recent_tool_sigs = recent_tool_sigs[-self._DUPLICATE_WINDOW * 2:]
 
                 if duplicate_detected:
+                    # Add synthetic tool responses so history stays valid for the API:
+                    # an assistant message with tool_calls must be followed by a tool
+                    # message per tool_call_id, or the next request returns 400.
+                    _skip_content = (
+                        "Skipped: duplicate call to avoid infinite loop. "
+                        "Present the discovery preview and export buttons from the previous result if available."
+                    )
+                    for tc in response.tool_calls:
+                        messages = self.context.add_tool_result(
+                            messages, tc.id, tc.name, _skip_content
+                        )
                     break
 
                 # Block save_csv when any tool in this batch is MCP (same-turn rule)
@@ -688,6 +733,28 @@ class AgentLoop:
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, ctx_result
                     )
+
+                    # Eagerly persist discovery results so /api/preview/latest can
+                    # serve data before the LLM streams the [Preview] sentinel.
+                    if sqlite_mgr and session_key and tool_call.name not in _EAGER_STORE_EXEMPT:
+                        eager_classification = classify_json_result(
+                            tool_call.name, result_str, parsed=_parsed,
+                        )
+                        if eager_classification:
+                            _shape, _row_count = eager_classification
+                            _label = make_discovery_label(tool_call.name, _shape, _row_count, result_str)
+                            try:
+                                await sqlite_mgr.insert_discovery_result(
+                                    session_id=session_key,
+                                    tool_name=tool_call.name,
+                                    payload=result_str,
+                                    query_or_label=_label,
+                                    shape=_shape,
+                                    row_count=_row_count,
+                                )
+                                eagerly_stored_ids.add(tool_call.id)
+                            except Exception as _e:
+                                logger.warning("Eager discovery persist failed: {}", _e)
             else:
                 clean = self._strip_think(response.content)
                 # Don't persist error responses to session history — they can
@@ -723,7 +790,7 @@ class AgentLoop:
                 "without completing the task. You can try breaking the task into smaller steps."
             )
 
-        return final_content, tools_used, messages, raw_payloads
+        return final_content, tools_used, messages, raw_payloads, eagerly_stored_ids
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -930,12 +997,13 @@ class AgentLoop:
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 memory_context=memory_context,
             )
-            final_content, _, all_msgs, raw_payloads = await self._run_agent_loop(
+            final_content, _, all_msgs, raw_payloads, eagerly_stored = await self._run_agent_loop(
                 messages, session_key=key, account_id=account_id, sqlite_mgr=sqlite_mgr,
             )
             await self._save_turn(session, all_msgs, 1 + len(history),
                                   sessions_mgr=sessions_mgr, sqlite_mgr=sqlite_mgr,
-                                  memory_store=memory_store, raw_payloads=raw_payloads)
+                                  memory_store=memory_store, raw_payloads=raw_payloads,
+                                  eagerly_stored_ids=eagerly_stored)
             await sessions_mgr.save(session)
             return OutboundMessage(channel=channel, chat_id=chat_id,
                                   content=final_content or "Background task completed.")
@@ -1054,11 +1122,11 @@ class AgentLoop:
             "message_length": len(msg.content),
         }, account_id=account_id)
 
-        # Inject account_id into intent tool for telemetry.
+        # Inject account_id and progress callback into intent tool (streams status/tokens to UI).
         if (intent_tool := self.tools.get("analyze_enrichment_intent")) and hasattr(intent_tool, "set_context"):
-            intent_tool.set_context(account_id=account_id)
+            intent_tool.set_context(account_id=account_id, on_progress=_effective_progress)
 
-        final_content, _, all_msgs, raw_payloads = await self._run_agent_loop(
+        final_content, _, all_msgs, raw_payloads, eagerly_stored = await self._run_agent_loop(
             initial_messages, on_progress=on_progress or _bus_progress,
             session_key=key, account_id=account_id, sqlite_mgr=sqlite_mgr,
         )
@@ -1068,7 +1136,8 @@ class AgentLoop:
 
         await self._save_turn(session, all_msgs, 1 + len(history),
                               sessions_mgr=sessions_mgr, sqlite_mgr=sqlite_mgr,
-                              memory_store=memory_store, raw_payloads=raw_payloads)
+                              memory_store=memory_store, raw_payloads=raw_payloads,
+                              eagerly_stored_ids=eagerly_stored)
         await sessions_mgr.save(session)
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
@@ -1091,6 +1160,7 @@ class AgentLoop:
         sqlite_mgr: SqliteManager | None = None,
         memory_store: MemoryStore | HybridMemoryStore | None = None,
         raw_payloads: dict[str, str] | None = None,
+        eagerly_stored_ids: set[str] | None = None,
     ) -> None:
         """Save new-turn messages into session. Hybrid: persist full content to DB and record discovery results."""
         from datetime import datetime
@@ -1111,27 +1181,14 @@ class AgentLoop:
             if role == "tool" and isinstance(content, str):
                 if use_hybrid:
                     tool_name_for_storage = entry.get("name") or "unknown"
-                    # Use the full uncompacted payload when available — the messages list may
-                    # contain a compacted (20-row preview) version for LLM context efficiency.
-                    # raw_payloads maps tool_call_id → original full result from _run_agent_loop.
                     tool_call_id = entry.get("tool_call_id", "")
                     payload_for_storage = (raw_payloads or {}).get(tool_call_id, content)
-                    # These tools return metadata/summaries, not datasets — never store as discovery results.
-                    # analyze_enrichment_intent in particular returns a JSON object with intent fields
-                    # that classify_json_result incorrectly treats as a complex object (0 rows),
-                    # which causes the agent to loop on "list_discovery_results" after user confirms.
-                    _DISCOVERY_EXEMPT = frozenset({
-                        "analyze_enrichment_intent",
-                        "list_discovery_results",
-                        "get_discovery_data",
-                        "deduplicate_results",
-                        "export_discovery_to_csv",
-                        "push_to_webhook",
-                        "save_csv",
-                        "analyze_discovery_data",
-                    })
+
+                    # Skip if already eagerly persisted in _run_agent_loop.
+                    already_stored = eagerly_stored_ids and tool_call_id in eagerly_stored_ids
                     classification = (
-                        None if tool_name_for_storage in _DISCOVERY_EXEMPT
+                        None if already_stored
+                        or tool_name_for_storage in _EAGER_STORE_EXEMPT
                         else classify_json_result(tool_name_for_storage, payload_for_storage)
                     )
                     if classification and effective_sqlite:
@@ -1152,9 +1209,10 @@ class AgentLoop:
                         except Exception as e:
                             logger.warning("Failed to store discovery result: {}", e)
 
-                        # Auto-upsert entities into cross-session canonical entity store.
-                        # This enables "have we seen this contact/company before?" across sessions.
-                        if effective_sqlite:
+                    # Auto-upsert entities into cross-session canonical entity store.
+                    if effective_sqlite and tool_name_for_storage not in _EAGER_STORE_EXEMPT:
+                        _cls = classification or classify_json_result(tool_name_for_storage, payload_for_storage)
+                        if _cls:
                             try:
                                 await _upsert_entities_from_payload(
                                     payload_for_storage, session.key, effective_sqlite

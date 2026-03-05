@@ -33,12 +33,158 @@ html, body, #root {
 
 /* ── Layout ────────────────────────────────────────────────────────────────── */
 
+/* Root shell: sidebar + main panel side by side */
+.app-shell {
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* Main chat area — takes remaining width */
+.main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
 .layout {
   display: flex;
   flex-direction: column;
-  height: 100vh;
+  height: 100%;
   max-width: 780px;
   margin: 0 auto;
+  width: 100%;
+}
+
+/* ── Sidebar ───────────────────────────────────────────────────────────────── */
+
+.sidebar {
+  width: 240px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.sidebar-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 12px 12px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.sidebar-header .brand-icon {
+  font-size: 1.2rem;
+  line-height: 1;
+}
+
+.sidebar-header .brand-name {
+  font-weight: 700;
+  font-size: 0.95rem;
+  flex: 1;
+  letter-spacing: -0.01em;
+}
+
+/* Compact "+" button in sidebar header */
+.btn-new-compact {
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 1rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: background 0.15s, border-color 0.15s;
+  line-height: 1;
+}
+
+.btn-new-compact:hover {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+/* Session list — scrollable */
+.session-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.session-list::-webkit-scrollbar { width: 4px; }
+.session-list::-webkit-scrollbar-track { background: transparent; }
+.session-list::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 999px;
+}
+
+.session-empty {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  text-align: center;
+  padding: 20px 8px;
+}
+
+/* Individual session button */
+.session-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.12s;
+  min-width: 0;
+}
+
+.session-item:hover {
+  background: rgba(0, 0, 0, 0.05);
+}
+
+.session-item--active {
+  background: rgba(79, 70, 229, 0.1);
+  border-left: 2px solid var(--accent);
+  padding-left: 8px;
+}
+
+.session-item--active:hover {
+  background: rgba(79, 70, 229, 0.14);
+}
+
+.session-title {
+  font-size: 0.8rem;
+  color: var(--text);
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  width: 100%;
+  max-width: 200px;
+}
+
+.session-date {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  flex-shrink: 0;
 }
 
 /* ── Top bar ───────────────────────────────────────────────────────────────── */
@@ -46,29 +192,12 @@ html, body, #root {
 .topbar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 12px 20px;
+  justify-content: flex-start;
+  padding: 10px 20px;
   border-bottom: 1px solid var(--border);
   background: var(--bg);
   flex-shrink: 0;
   gap: 12px;
-}
-
-.topbar-brand {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.brand-icon {
-  font-size: 1.35rem;
-  line-height: 1;
-}
-
-.brand-name {
-  font-weight: 700;
-  font-size: 1.05rem;
-  letter-spacing: -0.01em;
 }
 
 .session-badge {
@@ -80,25 +209,6 @@ html, body, #root {
   padding: 2px 8px;
   border-radius: 999px;
   cursor: default;
-}
-
-.btn-new {
-  padding: 7px 14px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border);
-  background: var(--bg);
-  color: var(--text);
-  font-size: 0.85rem;
-  font-weight: 500;
-  cursor: pointer;
-  transition: background 0.15s, border-color 0.15s;
-  white-space: nowrap;
-  flex-shrink: 0;
-}
-
-.btn-new:hover {
-  background: var(--surface);
-  border-color: #d1d5db;
 }
 
 /* ── Messages area ─────────────────────────────────────────────────────────── */
@@ -411,6 +521,34 @@ html, body, #root {
   cursor: not-allowed;
 }
 
+.btn-attach {
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-muted);
+  font-size: 1rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: background 0.15s, border-color 0.15s;
+  line-height: 1;
+}
+
+.btn-attach:hover:not(:disabled) {
+  background: var(--surface);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.btn-attach:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 .btn-send,
 .btn-stop {
   width: 40px;
@@ -445,6 +583,94 @@ html, body, #root {
 
 .btn-stop:hover {
   background: #e5e7eb;
+}
+
+/* ── Download button ───────────────────────────────────────────────────────── */
+
+/* All download links — both the offer button (#download-csv → /export/latest)
+   and ready file links (/download/<file>) — share the same indigo style. */
+.msg-markdown a.download-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  padding: 8px 16px;
+  background: var(--accent);
+  color: #fff !important;
+  border-radius: var(--radius-sm);
+  font-size: 0.85rem;
+  font-weight: 600;
+  text-decoration: none !important;
+  transition: background 0.15s, transform 0.1s;
+  cursor: pointer;
+}
+
+.msg-markdown a.download-btn::before {
+  content: "↓";
+  font-size: 1rem;
+}
+
+.msg-markdown a.download-btn:hover {
+  background: var(--accent-hover);
+  transform: translateY(-1px);
+}
+
+.msg-markdown a.download-btn:active {
+  transform: scale(0.97);
+}
+
+/* ── Export action buttons (Push to Segment / Push to Webhook) ─────────────── */
+/* Base shared styles for segment and webhook sentinels                         */
+.msg-markdown a.action-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  padding: 8px 16px;
+  color: #fff !important;
+  border-radius: var(--radius-sm);
+  font-size: 0.85rem;
+  font-weight: 600;
+  text-decoration: none !important;
+  transition: background 0.15s, transform 0.1s;
+  cursor: pointer;
+  user-select: none;
+}
+.msg-markdown a.action-btn:hover  { transform: translateY(-1px); }
+.msg-markdown a.action-btn:active { transform: scale(0.97); }
+
+/* Segment — green */
+.msg-markdown a.action-btn--segment              { background: #16a34a; }
+.msg-markdown a.action-btn--segment::before      { content: "→"; font-size: 1rem; }
+.msg-markdown a.action-btn--segment:hover        { background: #15803d; }
+
+/* Webhook — violet */
+.msg-markdown a.action-btn--webhook              { background: #7c3aed; }
+.msg-markdown a.action-btn--webhook::before      { content: "⇗"; font-size: 1rem; }
+.msg-markdown a.action-btn--webhook:hover        { background: #6d28d9; }
+
+/* ── Preview table (rendered client-side from #preview-last sentinel) ───────── */
+
+.preview-table-wrap {
+  margin: 12px 0;
+}
+
+.preview-meta {
+  font-size: 0.78rem;
+  color: var(--muted);
+  margin: 0 0 6px;
+}
+
+.preview-loading,
+.preview-error {
+  font-size: 0.85rem;
+  color: var(--muted);
+  padding: 8px 0;
+  margin: 0;
+}
+
+.preview-error {
+  color: #dc2626;
 }
 
 /* ── Scrollbar (webkit) ────────────────────────────────────────────────────── */

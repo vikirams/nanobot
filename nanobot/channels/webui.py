@@ -227,7 +227,7 @@ class WebUIChannel(BaseChannel):
             get_account_db_path,
             get_workspace_db_path,
         )
-        from nanobot.agent.tools.discovery import _rows_from_payload
+        from nanobot.agent.tools.discovery_helpers import rows_from_payload
 
         # --- Auth -----------------------------------------------------------
         api_key_val = self.config.api_key.get_secret_value()
@@ -306,7 +306,7 @@ class WebUIChannel(BaseChannel):
 
         # --- Build CSV ------------------------------------------------------
         _, payload_str, _ = result_row
-        rows = _rows_from_payload(payload_str)
+        rows = rows_from_payload(payload_str)
         if not rows:
             return web.Response(
                 status=404,
@@ -503,7 +503,7 @@ class WebUIChannel(BaseChannel):
             get_account_db_path,
             get_workspace_db_path,
         )
-        from nanobot.agent.tools.discovery import _rows_from_payload
+        from nanobot.agent.tools.discovery_helpers import rows_from_payload
 
         api_key_val = self.config.api_key.get_secret_value()
         if api_key_val:
@@ -572,7 +572,7 @@ class WebUIChannel(BaseChannel):
             )
 
         _, payload_str, _ = result_row
-        all_rows = _rows_from_payload(payload_str)
+        all_rows = rows_from_payload(payload_str)
         if not all_rows:
             return web.Response(
                 status=404,

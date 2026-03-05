@@ -11,6 +11,7 @@ services:
     <<: *common-config
     command: ["gateway"]
     restart: unless-stopped
+    stop_grace_period: 30s   # give Python time to flush zvec before SIGKILL
     ports:
       - 18790:18790
       - 8080:8080    # WebUI SSE channel — React frontend connects here
@@ -22,6 +23,10 @@ services:
         reservations:
           cpus: '0.25'
           memory: 256M
+    environment: # New section for environment variables
+      NANOBOT_ENABLE_HYBRID_MEMORY: "true"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
   
   nanobot-cli:
     <<: *common-config
