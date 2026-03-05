@@ -212,18 +212,18 @@ class ZvecManager:
                 )
 
             try:
-                self._collection = zvec.open(path=str(zvec_path))
+                coll = zvec.open(path=str(zvec_path))
                 # Probe: write a canary doc then immediately query for it.
                 # zvec.open() can silently succeed even when the HNSW index is
                 # corrupted — C++ errors are logged to stderr but never raised as
                 # Python exceptions.  A failed write→read round-trip exposes this.
                 _probe_vec = [0.0] * (self._dim - 1) + [1.0]
-                self._collection.upsert(zvec.Doc(
+                coll.upsert(zvec.Doc(
                     id="__probe__",
                     fields={"type": "_probe_", "workspace_key": "", "metadata_json": "{}"},
                     vectors={"embedding": _probe_vec},
                 ))
-                _probe_results = self._collection.query(
+                _probe_results = coll.query(
                     vectors=VectorQuery("embedding", vector=_probe_vec),
                     topk=1,
                     filter="type='_probe_'",
@@ -233,11 +233,20 @@ class ZvecManager:
                         "zvec probe failed: upsert succeeded but query returned empty "
                         "— HNSW index is silently corrupted at C++ level"
                     )
+                self._collection = coll
                 logger.debug(f"Opened zvec collection at {zvec_path} (probe OK)")
             except Exception as open_err:
-                # open() failed — could be missing dir, empty dir, or corrupted.
-                # Remove whatever is there (shutil.rmtree handles non-empty dirs)
-                # and rebuild from scratch. Embeddings are regeneratable from SQLite.
+                # Release the corrupted handle BEFORE rmtree so RocksDB's
+                # in-process lock on idmap.0/LOCK is freed.  Without this,
+                # create_and_open() fails with "lock hold by current process".
+                import gc
+
+                try:
+                    del coll
+                except NameError:
+                    pass
+                gc.collect()
+
                 if zvec_path.exists():
                     try:
                         shutil.rmtree(str(zvec_path))

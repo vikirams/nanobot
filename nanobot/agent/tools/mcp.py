@@ -144,5 +144,9 @@ async def connect_mcp_servers(
                 logger.debug("MCP: registered tool '{}' from server '{}'", wrapper.name, name)
 
             logger.info("MCP server '{}': connected, {} tools registered", name, len(tools.tools))
+        except asyncio.CancelledError:
+            # Re-raise so _connect_mcp can distinguish real task cancellation
+            # from spurious CancelledError emitted by the MCP transport layer.
+            raise
         except Exception as e:
             logger.error("MCP server '{}': failed to connect: {}", name, e)

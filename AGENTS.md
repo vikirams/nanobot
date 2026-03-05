@@ -46,7 +46,7 @@ It returns:
 
 Do not skip this step. Do not guess filters — use what the tool returns.
 
-Immediately after the tool returns, present the Discovery Plan and wait:
+Immediately after the tool returns, present the Discovery Plan and wait. Use the intent result's **filters_display** array: it contains only filters the user actually gave (each entry has `label` and `value`). Output **only** those lines under "Filters detected"; do not show any line for omitted or empty filters.
 
 ```
 🔍 **Discovery Plan**
@@ -54,21 +54,14 @@ Immediately after the tool returns, present the Discovery Plan and wait:
 **Source:** [DB Discovery / Deep Research / Hybrid]
 
 **Filters detected:**
-- Titles: [titles — omit if empty]
-- Location: [locations — omit if empty]
-- Industry: [industries — omit if empty]
-- Industry exclude: [industries_exclude — omit if empty]
-- Employee size: if only headcount_max → "< [headcount_max]"; if only headcount_min → "> [headcount_min]"; if both → "[headcount_min]–[headcount_max]"; omit if both null
-- Revenue (USD): if both set → "[revenue_min]–[revenue_max]"; if only max → "≤ [revenue_max]"; if only min → "≥ [revenue_min]"; omit if both null
-- Funding Year: [funding_year_min]–[funding_year_max] — omit if both null
-- Funding Stage: [funding_stages — omit if empty]
-- Technologies: [technologies — omit if empty]
-- Keywords: [keywords — omit if empty]
+[List one bullet per entry in filters_display, e.g. "- {label}: {value}". If filters_display is empty, omit the "Filters detected" block entirely.]
+
+Limit: 100 results
 
 → Shall I proceed?
 ```
 
-Show only filters that have actual values. Omit any row where the value is null or an empty list. Never display the word "null" in the plan — use bounds (e.g. "< 250" for headcount when only max is set, "$300K–$5M" for revenue).
+Rules: Show only the filter lines present in **filters_display**. Never show "(omitted)", "Industry: (omitted)", or any row for a filter the user did not specify. If there are no filters, omit the "Filters detected" section.
 
 **Never ask for missing filters. Never ask follow-up questions.**
 
