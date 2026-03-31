@@ -1,31 +1,29 @@
+FROM node:20-bookworm-slim AS node_source
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
-# Install Node.js 20 for the WhatsApp bridge
+# ── Node.js 20 — copy from official image ──
+# This avoids slow nodesource CDN and apt-get hanging issues
+COPY --from=node_source /usr/local/ /usr/local/
+
+# Install only what apt still needs (git for pip VCS installs)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl ca-certificates gnupg git && \
-    mkdir -p /etc/apt/keyrings && \
-    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
-    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" > /etc/apt/sources.list.d/nodesource.list && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends nodejs && \
-    apt-get purge -y gnupg && \
-    apt-get autoremove -y && \
+    apt-get install -y --no-install-recommends git && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install Python dependencies first (cached layer)
+# ── Python deps (cached layer — only re-runs when pyproject.toml changes) ──
 COPY pyproject.toml README.md LICENSE ./
 RUN mkdir -p nanobot bridge && touch nanobot/__init__.py && \
     uv pip install --system --no-cache . && \
     rm -rf nanobot bridge
 
-# Copy the full source and install
+# ── Application source ──
 COPY nanobot/ nanobot/
 COPY bridge/ bridge/
 RUN uv pip install --system --no-cache .
 
-# Build the WhatsApp bridge
+# ── WhatsApp bridge (npm install + build) ──
 WORKDIR /app/bridge
 RUN npm install && npm run build
 WORKDIR /app

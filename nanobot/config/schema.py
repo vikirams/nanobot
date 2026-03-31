@@ -12,7 +12,7 @@ from pydantic_settings import BaseSettings
 class Base(BaseModel):
     """Base model that accepts both camelCase and snake_case keys."""
 
-    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="ignore")
 
 
 class WhatsAppConfig(Base):
@@ -246,15 +246,26 @@ class AgentDefaults(Base):
     provider: str = (
         "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
     )
+    embedding_model: str | None = None  # Global embedding model (e.g. "text-embedding-3-small")
     max_tokens: int = 8192
     temperature: float = 0.1
     max_tool_iterations: int = 40
     memory_window: int = 100
     reasoning_effort: str | None = None  # low / medium / high — enables LLM thinking mode
-    # Optional fast model for intent classification. If set, and if the "groq" provider
-    # is configured, a dedicated GROQ LiteLLMProvider is used for analyze_enrichment_intent
-    # to reduce latency (~9s → ~1s). Example: "moonshotai/kimi-k1.5".
+    # Optional model override for intent classification (analyze_enrichment_intent tool).
+    # Uses the main provider. Example: "vercel_ai_gateway/google/gemini-2.5-flash-lite".
     intent_model: str | None = None
+    # Fast model used to translate thinking-model reasoning tokens into user-readable
+    # status messages in real time. Only active when the intent model emits reasoning
+    # tokens (e.g. deepseek-thinking). Use a small/fast model.
+    # Example: "vercel_ai_gateway/google/gemini-2.0-flash"
+    thinking_translator_model: str | None = None
+    # Fallback account for channels without explicit account_id (e.g. Telegram, Discord).
+    default_account_id: str = "default"
+    # Embedding model for semantic memory (pgvector). Routed through the same provider
+    # as the main model — use a fully-qualified LiteLLM model string.
+    # Example: "vercel_ai_gateway/openai/text-embedding-3-small"
+    embedding_model: str | None = None
 
 
 class AgentsConfig(Base):
@@ -284,21 +295,18 @@ class ProvidersConfig(Base):
     groq: ProviderConfig = Field(default_factory=ProviderConfig)
     zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
     dashscope: ProviderConfig = Field(default_factory=ProviderConfig)  # 阿里云通义千问
+    nvidia_nim: ProviderConfig = Field(default_factory=ProviderConfig)  # NVIDIA NIM (integrate.api.nvidia.com)
+    ollama: ProviderConfig = Field(default_factory=ProviderConfig)      # Ollama (Cloud or Local)
     vllm: ProviderConfig = Field(default_factory=ProviderConfig)
     gemini: ProviderConfig = Field(default_factory=ProviderConfig)
     moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
     minimax: ProviderConfig = Field(default_factory=ProviderConfig)
     aihubmix: ProviderConfig = Field(default_factory=ProviderConfig)  # AiHubMix API gateway
-    siliconflow: ProviderConfig = Field(default_factory=ProviderConfig)  # SiliconFlow (硅基流动)
-    volcengine: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine (火山引擎)
+    vercel: ProviderConfig = Field(default_factory=ProviderConfig)  # Vercel AI Gateway (only apiKey needed; LiteLLM handles the URL)
+    siliconflow: ProviderConfig = Field(default_factory=ProviderConfig)  # SiliconFlow (硅基流动) API gateway
+    volcengine: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine (火山引擎) API gateway
     openai_codex: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenAI Codex (OAuth)
     github_copilot: ProviderConfig = Field(default_factory=ProviderConfig)  # Github Copilot (OAuth)
-
-
-class SandboxConfig(Base):
-    """Code execution sandbox configuration for analyze_discovery_data."""
-
-    provider: str = "subprocess"  # "subprocess" (default) | "inprocess"
 
 
 class TelemetryConfig(Base):
@@ -355,7 +363,7 @@ class MCPServerConfig(Base):
     env: dict[str, str] = Field(default_factory=dict)  # Stdio: extra env vars
     url: str = ""  # HTTP/SSE: endpoint URL
     headers: dict[str, str] = Field(default_factory=dict)  # HTTP/SSE: custom headers
-    tool_timeout: int = 30  # seconds before a tool call is cancelled
+    tool_timeout: int = 60  # seconds before a tool call is cancelled
 
 
 class ToolsConfig(Base):
@@ -367,6 +375,18 @@ class ToolsConfig(Base):
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
 
+class DatabaseConfig(Base):
+    """PostgreSQL database configuration."""
+
+    url: str = ""  # postgresql://host:5432/db  (credentials injected from user/password below)
+    user: str = ""  # NANOBOT_DATABASE__USER — injected into url at runtime (keeps creds out of config.json)
+    password: str = ""  # NANOBOT_DATABASE__PASSWORD — same
+    pool_min_size: int = 2
+    pool_max_size: int = 10
+    pool_command_timeout: int = 60
+    embedding_dim: int = 1536  # must match embedding model output
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
@@ -376,8 +396,7 @@ class Config(BaseSettings):
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
-    sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
-    enable_hybrid_memory: bool = True  # Enable SQLite + semantic hybrid memory
+    database: DatabaseConfig = Field(default_factory=DatabaseConfig)
 
     @property
     def workspace_path(self) -> Path:
@@ -444,18 +463,15 @@ class Config(BaseSettings):
         return p.api_key.get_secret_value() if p else None
 
     def get_api_base(self, model: str | None = None) -> str | None:
-        """Get API base URL for the given model. Applies default URLs for known gateways."""
+        """Get API base URL for the given model. Applies default URLs for known gateways and providers that define one (e.g. NVIDIA NIM)."""
         from nanobot.providers.registry import find_by_name
 
         p, name = self._match_provider(model)
         if p and p.api_base:
             return p.api_base
-        # Only gateways get a default api_base here. Standard providers
-        # (like Moonshot) set their base URL via env vars in _setup_env
-        # to avoid polluting the global litellm.api_base.
         if name:
             spec = find_by_name(name)
-            if spec and spec.is_gateway and spec.default_api_base:
+            if spec and spec.default_api_base:
                 return spec.default_api_base
         return None
 

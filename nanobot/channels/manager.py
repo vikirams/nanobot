@@ -156,7 +156,8 @@ class ChannelManager:
                 from nanobot.channels.webui import WebUIChannel
                 self.channels["webui"] = WebUIChannel(
                     self.config.channels.webui, self.bus,
-                    workspace_path=self.config.workspace_path
+                    workspace_path=self.config.workspace_path,
+                    mcp_config=self.config.tools.mcp_servers,
                 )
                 logger.info(
                     "WebUI channel enabled on port {}", self.config.channels.webui.port

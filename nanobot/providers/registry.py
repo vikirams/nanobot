@@ -162,6 +162,32 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=False,
         model_overrides=(),
     ),
+
+    # Vercel AI Gateway: native LiteLLM provider (vercel_ai_gateway/ prefix).
+    # LiteLLM base URL is hardcoded to https://ai-gateway.vercel.sh/v1 — no api_base needed.
+    # Only VERCEL_AI_GATEWAY_API_KEY (or apiKey in config) is required.
+    # Model format: vercel_ai_gateway/{backend}/{model}
+    # e.g. vercel_ai_gateway/openai/gpt-4o
+    #      vercel_ai_gateway/anthropic/claude-4-sonnet
+    #      vercel_ai_gateway/bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0
+    #      vercel_ai_gateway/google/gemini-2.0-flash
+    ProviderSpec(
+        name="vercel",
+        keywords=("vercel",),
+        env_key="VERCEL_AI_GATEWAY_API_KEY",
+        display_name="Vercel AI Gateway",
+        litellm_prefix="vercel_ai_gateway",  # → vercel_ai_gateway/{backend}/{model}
+        skip_prefixes=("vercel_ai_gateway/",),
+        env_extras=(),
+        is_gateway=True,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="vercel",
+        default_api_base="",                 # LiteLLM uses https://ai-gateway.vercel.sh/v1 internally
+        strip_model_prefix=False,            # preserve backend prefix: bedrock/..., google/..., etc.
+        model_overrides=(),
+    ),
+
     # === Standard providers (matched by model-name keywords) ===============
     # Anthropic: LiteLLM recognizes "claude-*" natively, no prefix needed.
     ProviderSpec(
@@ -287,6 +313,26 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=False,
         model_overrides=(),
     ),
+
+    # NVIDIA NIM: OpenAI-compatible; use model "nvidia_nim/..." or keyword "nim".
+    # Must appear before DashScope so "nvidia_nim/qwen/..." uses NIM, not Alibaba.
+    ProviderSpec(
+        name="nvidia_nim",
+        keywords=("nvidia_nim", "nim"),
+        env_key="NVIDIA_NIM_API_KEY",
+        display_name="NVIDIA NIM",
+        litellm_prefix="nvidia_nim",        # nvidia_nim/... → nvidia_nim/...
+        skip_prefixes=("nvidia_nim/", "openrouter/"),
+        env_extras=(),
+        is_gateway=False,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="",
+        default_api_base="https://integrate.api.nvidia.com/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
+
     # DashScope: Qwen models, needs "dashscope/" prefix.
     ProviderSpec(
         name="dashscope",
@@ -341,6 +387,25 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=False,
         model_overrides=(),
     ),
+
+    # Ollama (Cloud or Local) - routes via ollama_chat for /api/chat compatibility
+    ProviderSpec(
+        name="ollama",
+        keywords=("ollama", "ollama_chat", "ollama-cloud"),
+        env_key="OLLAMA_API_KEY",
+        display_name="Ollama",
+        litellm_prefix="ollama_chat",        # model → ollama_chat/model (uses POST /api/chat)
+        skip_prefixes=("ollama_chat/", "ollama/", "openrouter/"),
+        env_extras=(),
+        is_gateway=False,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="",
+        default_api_base="https://ollama.com/api/chat",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
+
     # === Local deployment (matched by config key, NOT by api_base) =========
     # vLLM / any OpenAI-compatible local server.
     # Detected when config key is "vllm" (provider_name="vllm").
@@ -381,6 +446,12 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
     ),
 )
 
+
+# ---------------------------------------------------------------------------
+# Fast lookup index — built once at import time
+# ---------------------------------------------------------------------------
+
+_BY_NAME: dict[str, ProviderSpec] = {s.name: s for s in PROVIDERS}
 
 # ---------------------------------------------------------------------------
 # Lookup helpers
@@ -442,7 +513,4 @@ def find_gateway(
 
 def find_by_name(name: str) -> ProviderSpec | None:
     """Find a provider spec by config field name, e.g. "dashscope"."""
-    for spec in PROVIDERS:
-        if spec.name == name:
-            return spec
-    return None
+    return _BY_NAME.get(name)

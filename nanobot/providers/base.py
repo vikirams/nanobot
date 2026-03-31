@@ -110,7 +110,9 @@ class LLMProvider(ABC):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
+        thinking: dict[str, Any] | None = None,
         on_token: Callable[[str], Awaitable[None]] | None = None,
+        on_reasoning_token: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         """
         Send a chat completion request.
@@ -121,6 +123,10 @@ class LLMProvider(ABC):
             model: Model identifier (provider-specific).
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
+            thinking: Optional thinking config for models that support it
+                      (e.g. ``{"type": "enabled", "budget_tokens": 8192}``).
+                      Dropped automatically for models that don't support it
+                      when ``litellm.drop_params = True``.
             on_token: Optional async callback called with each streamed text token.
                       When provided, the provider streams the response and calls
                       on_token(delta) for each content chunk received.
@@ -152,3 +158,24 @@ class LLMProvider(ABC):
             f"{type(self).__name__} does not support embeddings. "
             "Override embed() or set get_embedding_model() to None to disable semantic memory."
         )
+
+    @staticmethod
+    def _flatten_content_blocks(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Flatten list content blocks in system messages to plain strings.
+
+        Shared by providers that don't support cache_control (CustomProvider,
+        non-caching LiteLLM paths) so both use one implementation.
+        """
+        out: list[dict[str, Any]] = []
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list) and msg.get("role") == "system":
+                flat = "\n".join(
+                    block.get("text", "")
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                )
+                out.append({**msg, "content": flat})
+            else:
+                out.append(msg)
+        return out

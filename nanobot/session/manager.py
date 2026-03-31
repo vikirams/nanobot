@@ -1,4 +1,6 @@
-"""Session management for conversation history."""
+"""Session data model for in-memory conversation state."""
+
+from __future__ import annotations
 
 import json
 import shutil
@@ -16,13 +18,10 @@ from nanobot.utils.helpers import ensure_dir, safe_filename
 @dataclass
 class Session:
     """
-    A conversation session.
+    In-memory representation of a conversation session.
 
-    Stores messages in JSONL format for easy reading and persistence.
-
-    Important: Messages are append-only for LLM cache efficiency.
-    The consolidation process writes summaries to MEMORY.md/HISTORY.md
-    but does NOT modify the messages list or get_history() output.
+    Messages are append-only; consolidation updates last_consolidated
+    but does not remove messages from the list.
     """
 
     key: str  # channel:chat_id
@@ -30,32 +29,23 @@ class Session:
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
-    last_consolidated: int = 0  # Number of messages already consolidated to files
-    # In-memory only: used for append-only save.
-    _last_saved_count: int = 0
-    _last_saved_metadata: tuple[int, str, str] | None = None  # snapshot when we last saved
-
-    def add_message(self, role: str, content: str, **kwargs: Any) -> None:
-        """Add a message to the session."""
-        msg = {
-            "role": role,
-            "content": content,
-            "timestamp": datetime.now().isoformat(),
-            **kwargs
-        }
-        self.messages.append(msg)
-        self.updated_at = datetime.now()
+    last_consolidated: int = 0
 
     def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
         """Return unconsolidated messages for LLM input, aligned to a user turn."""
         unconsolidated = self.messages[self.last_consolidated:]
         sliced = unconsolidated[-max_messages:]
 
-        # Drop leading non-user messages to avoid orphaned tool_result blocks
+        # Drop leading non-user messages to avoid orphaned tool_result blocks.
+        # If no user turn exists at all (e.g. only the assistant+tool rows
+        # written by insert_discovery_result are in the session), treat history
+        # as empty so the LLM starts from a clean slate.
         for i, m in enumerate(sliced):
             if m.get("role") == "user":
                 sliced = sliced[i:]
                 break
+        else:
+            return []
 
         out: list[dict[str, Any]] = []
         for m in sliced:

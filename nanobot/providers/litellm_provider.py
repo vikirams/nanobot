@@ -131,16 +131,28 @@ class LiteLLMProvider(LLMProvider):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
-        """Return copies of messages and tools with cache_control injected."""
+        """Return copies of messages and tools with cache_control injected.
+
+        For system messages with multiple content blocks the cache breakpoint
+        is placed on every block EXCEPT the last one.  This lets providers
+        cache the large static prefix (identity + AGENTS.md + skills) while
+        the dynamic suffix (memory context, date) can change without
+        invalidating the cached prefix.
+        """
         new_messages = []
         for msg in messages:
             if msg.get("role") == "system":
                 content = msg["content"]
                 if isinstance(content, str):
                     new_content = [{"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}]
+                elif len(content) <= 1:
+                    new_content = [{**content[0], "cache_control": {"type": "ephemeral"}}]
                 else:
-                    new_content = list(content)
-                    new_content[-1] = {**new_content[-1], "cache_control": {"type": "ephemeral"}}
+                    new_content = [
+                        {**block, "cache_control": {"type": "ephemeral"}}
+                        if i < len(content) - 1 else dict(block)
+                        for i, block in enumerate(content)
+                    ]
                 new_messages.append({**msg, "content": new_content})
             else:
                 new_messages.append(msg)
@@ -217,7 +229,9 @@ class LiteLLMProvider(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
+        thinking: dict[str, Any] | None = None,
         on_token: Callable[[str], Awaitable[None]] | None = None,
+        on_reasoning_token: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         """
         Send a chat completion request via LiteLLM.
@@ -229,6 +243,7 @@ class LiteLLMProvider(LLMProvider):
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
             reasoning_effort: Optional reasoning effort (e.g. low/medium/high) for thinking models.
+            thinking: Optional thinking config (e.g. {"type": "enabled", "budget_tokens": 8192}).
             on_token: Optional async callback for streamed text tokens.
                       When provided, streaming is enabled and on_token(delta) is
                       called for each content chunk as it arrives.
@@ -242,6 +257,8 @@ class LiteLLMProvider(LLMProvider):
 
         if self._supports_cache_control(original_model):
             messages, tools = self._apply_cache_control(messages, tools)
+        else:
+            messages = self._flatten_content_blocks(messages)
 
         # Clamp max_tokens to at least 1 — negative or zero values cause
         # LiteLLM to reject the request with "max_tokens must be at least 1".
@@ -273,15 +290,19 @@ class LiteLLMProvider(LLMProvider):
             kwargs["reasoning_effort"] = reasoning_effort
             kwargs["drop_params"] = True
 
+        if thinking:
+            kwargs["thinking"] = thinking
+            kwargs["drop_params"] = True
+
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
 
         try:
-            # Streaming path: when on_token is provided, stream content deltas then
-            # reconstruct full response from chunks (including tool_calls) for parsing.
-            if on_token:
-                return await self._chat_streaming(kwargs, on_token)
+            # Streaming path: when on_token or on_reasoning_token is provided, stream
+            # content/reasoning deltas then reconstruct full response from chunks.
+            if on_token or on_reasoning_token:
+                return await self._chat_streaming(kwargs, on_token, on_reasoning_token)
 
             response = await acompletion(**kwargs)
             return self._parse_response(response)
@@ -295,9 +316,10 @@ class LiteLLMProvider(LLMProvider):
     async def _chat_streaming(
         self,
         kwargs: dict[str, Any],
-        on_token: Callable[[str], Awaitable[None]],
+        on_token: Callable[[str], Awaitable[None]] | None,
+        on_reasoning_token: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
-        """Stream the response, calling on_token for each chunk, then return full LLMResponse."""
+        """Stream the response, calling on_token/on_reasoning_token for each chunk."""
         stream_kwargs = {**kwargs, "stream": True}
         chunks: list[Any] = []
         collected_content = ""
@@ -306,14 +328,30 @@ class LiteLLMProvider(LLMProvider):
             response = await acompletion(**stream_kwargs)
             async for chunk in response:
                 chunks.append(chunk)
-                delta = (
-                    chunk.choices[0].delta.content
-                    if chunk.choices and chunk.choices[0].delta
-                    else None
-                )
-                if delta:
-                    collected_content += delta
-                    await on_token(delta)
+                if not (chunk.choices and chunk.choices[0].delta):
+                    continue
+                delta = chunk.choices[0].delta
+
+                # Content tokens — main response text
+                if delta.content:
+                    collected_content += delta.content
+                    if on_token:
+                        await on_token(delta.content)
+
+                # Reasoning tokens — thinking model chain-of-thought.
+                # Path 1: native reasoning_content (DeepSeek, some Gemini versions)
+                reasoning = getattr(delta, "reasoning_content", None)
+                if reasoning and on_reasoning_token:
+                    await on_reasoning_token(reasoning)
+
+                # Path 2: provider_specific_fields.thinking_blocks (Gemini/Anthropic)
+                if not reasoning and on_reasoning_token:
+                    psf = getattr(delta, "provider_specific_fields", None)
+                    if isinstance(psf, dict):
+                        for block in psf.get("thinking_blocks") or []:
+                            if isinstance(block, dict) and block.get("thinking"):
+                                await on_reasoning_token(block["thinking"])
+
         except Exception:
             # Fall back to non-streaming if streaming fails
             response = await acompletion(**{k: v for k, v in stream_kwargs.items() if k != "stream"})
@@ -391,8 +429,12 @@ class LiteLLMProvider(LLMProvider):
         """Return the configured embedding model, or None if not set."""
         return self._embedding_model
 
-    async def embed(self, input: list[str], model: str, **kwargs: Any) -> Any:
-        """Generate embeddings via LiteLLM's aembedding."""
+    async def embed(self, input: list[str], model: str, **kwargs: Any) -> list[float]:
+        """Generate embeddings via LiteLLM's aembedding.
+
+        Returns the first embedding as a plain list[float].
+        LiteLLM returns an EmbeddingResponse; this unpacks .data[0].embedding.
+        """
         embed_kwargs: dict[str, Any] = {"model": model, "input": input}
         if self.api_key:
             embed_kwargs["api_key"] = self.api_key
@@ -400,4 +442,13 @@ class LiteLLMProvider(LLMProvider):
             embed_kwargs["api_base"] = self.api_base
         if self.extra_headers:
             embed_kwargs["extra_headers"] = self.extra_headers
-        return await aembedding(**embed_kwargs)
+        response = await aembedding(**embed_kwargs)
+        # EmbeddingResponse.data is a list of {"embedding": [...], "index": N, ...}
+        data = response.data
+        if not data:
+            raise ValueError("EmbeddingResponse contained no data")
+        item = data[0]
+        # item may be a dict or an object with .embedding attribute
+        if isinstance(item, dict):
+            return item["embedding"]
+        return item.embedding

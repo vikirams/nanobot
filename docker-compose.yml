@@ -1,20 +1,20 @@
-x-common-config: &common-config
-  build:
-    context: .
-    dockerfile: Dockerfile
-  volumes:
-    - ~/.nanobot:/root/.nanobot
+# Nanobot gateway — reuses the hp-mcp-server postgres (port 5433 on host).
+# Start MCP server first: cd ../hp-mcp-server && docker compose up -d
+# Then: ./redeploy.sh  (or: docker compose up -d)
 
 services:
   nanobot-gateway:
     container_name: nanobot-gateway
-    <<: *common-config
+    build:
+      context: .
+      dockerfile: Dockerfile
+      network: host
     command: ["gateway"]
     restart: unless-stopped
-    stop_grace_period: 30s   # give Python time to flush zvec before SIGKILL
+    stop_grace_period: 30s
     ports:
-      - 18790:18790
-      - 8080:8080    # WebUI SSE channel — React frontend connects here
+      - "18790:18790"
+      - "8080:8080"       # WebUI API + SSE — React frontend (localhost:5173) connects here
     deploy:
       resources:
         limits:
@@ -23,15 +23,36 @@ services:
         reservations:
           cpus: '0.25'
           memory: 256M
-    environment: # New section for environment variables
-      NANOBOT_ENABLE_HYBRID_MEMORY: "true"
+    volumes:
+      - ~/.nanobot:/root/.nanobot
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Local default: hp-mcp-server postgres on host (port 5433).
+      # Override via NANOBOT_DATABASE__URL env var for EC2/RDS.
+      NANOBOT_DATABASE__URL: "${NANOBOT_DATABASE__URL:-postgresql://hp_mcp:hp_mcp_dev@host.docker.internal:5433/nanobot}"
+      NANOBOT_DATABASE__POOL_MIN_SIZE: "2"
+      NANOBOT_DATABASE__POOL_MAX_SIZE: "10"
     extra_hosts:
-      - "host.docker.internal:host-gateway"
-  
+      - "host.docker.internal:host-gateway"   # Linux host resolution (no-op on Mac)
+
   nanobot-cli:
-    <<: *common-config
+    build:
+      context: .
+      dockerfile: Dockerfile
+      network: host
     profiles:
       - cli
     command: ["status"]
     stdin_open: true
     tty: true
+    volumes:
+      - ~/.nanobot:/root/.nanobot
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      NANOBOT_DATABASE__URL: "${NANOBOT_DATABASE__URL:-postgresql://hp_mcp:hp_mcp_dev@host.docker.internal:5433/nanobot}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

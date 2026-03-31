@@ -5,348 +5,406 @@ import json
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, List, TYPE_CHECKING
 
 from loguru import logger
 
 from nanobot.session.manager import Session
-from nanobot.hybrid_memory.sqlite_manager import SqliteManager
-from nanobot.hybrid_memory.zvec_manager import ZvecManager
 from nanobot.providers.base import LLMProvider
+
+if TYPE_CHECKING:
+    from nanobot.db.manager import DBManager
+    from nanobot.db.pgvector_manager import PGVectorManager
 
 
 class HybridSessionManager:
     """
-    Manages conversation sessions using SQLite for persistence.
+    Manages conversation sessions backed by PostgreSQL.
 
-    Accepts a shared SqliteManager so the caller controls connection lifetime
-    and avoids opening two connections to the same database file.
     Session cache uses LRU eviction to bound memory (default max 500 entries).
     """
 
     _CACHE_MAX_SIZE = 500
 
-    def __init__(self, workspace: Path, sqlite_manager: SqliteManager):
+    def __init__(
+        self,
+        workspace: Path,
+        db_manager: "DBManager",
+    ) -> None:
         self.workspace = workspace
-        self._sqlite_manager = sqlite_manager
+        self._db_manager = db_manager
         self._cache: OrderedDict[str, Session] = OrderedDict()
 
-    async def get_or_create(self, key: str) -> Session:
-        """Get an existing session from SQLite or create a new one."""
+    async def get_or_create(
+        self,
+        key: str,
+        account_id: str = "",
+        user_id: str = "",
+        channel: str = "web",
+    ) -> Session:
+        """Get an existing session from the DB or create a new one."""
         if key in self._cache:
             self._cache.move_to_end(key)
             return self._cache[key]
 
-        session = await self._load_session_from_db(key)
+        session = await self._load_session(key, account_id, user_id, channel)
+
         if session is None:
-            logger.info(f"Creating new session for key: {key}")
+            logger.info("Creating new session for key: {}", key)
             session = Session(key=key)
+            if account_id:
+                try:
+                    await self._db_manager.upsert_session(
+                        session_id=key,
+                        account_id=account_id,
+                        user_id=user_id,
+                        channel=channel,
+                    )
+                except Exception:
+                    logger.exception("Failed to upsert session row for {}", key)
 
         while len(self._cache) >= self._CACHE_MAX_SIZE:
             self._cache.popitem(last=False)
         self._cache[key] = session
         return session
 
-    async def _load_session_from_db(self, key: str) -> Optional[Session]:
-        """Load a session and reconstruct its full message list from SQLite.
+    async def _load_session(
+        self,
+        key: str,
+        account_id: str,
+        user_id: str,
+        channel: str,
+    ) -> Session | None:
+        """Load (or create) a session row in Postgres and reconstruct messages."""
+        try:
+            await self._db_manager.upsert_session(
+                session_id=key,
+                account_id=account_id,
+                user_id=user_id,
+                channel=channel,
+            )
+            session_row = await self._db_manager.get_session(key)
+        except Exception:
+            logger.exception("Failed to load session {} from Postgres", key)
+            return None
 
-        Also restores persisted metadata (last_consolidated, workspace_key) so
-        memory consolidation picks up exactly where it left off after a restart.
-        """
-        # get_messages_for_session internally calls _get_conn() — no need for a
-        # separate, direct call to the private method.
-        messages_data = await self._sqlite_manager.get_messages_for_session(key, limit=-1)
+        try:
+            messages_data = await self._db_manager.get_messages_for_session(key, limit=-1)
+        except Exception:
+            logger.exception("Failed to load messages for session {}", key)
+            messages_data = []
 
         if not messages_data:
-            return None
+            last_consolidated = session_row.get("last_consolidated", 0) if session_row else 0
+            return Session(key=key, last_consolidated=last_consolidated)
 
         messages = []
         for msg_row in messages_data:
-            # Prefer raw_data (preserves tool_calls, tool_call_id, name, etc.)
-            if msg_row.get("raw_data"):
-                msg = dict(msg_row["raw_data"])
+            content_raw = msg_row.get("content", {})
+            if isinstance(content_raw, dict):
+                msg = dict(content_raw)
             else:
-                # Fallback for rows written before raw_data was added
-                msg = {"role": msg_row["role"], "content": msg_row["content"]}
-                if msg_row.get("presented_data_context"):
-                    msg["presented_data_context"] = msg_row["presented_data_context"]
-
-            # Ensure timestamp is present
-            msg.setdefault("timestamp", msg_row.get("timestamp", datetime.now().isoformat()))
+                try:
+                    msg = json.loads(content_raw)
+                except Exception:
+                    msg = {"role": msg_row.get("role", "user"), "content": str(content_raw)}
+            msg.setdefault("timestamp", str(msg_row.get("created_at", datetime.now().isoformat())))
             messages.append(msg)
 
-        created_at = datetime.fromisoformat(messages[0]["timestamp"])
-        updated_at = datetime.fromisoformat(messages[-1]["timestamp"])
+        if messages:
+            try:
+                created_at = datetime.fromisoformat(str(messages[0]["timestamp"]).replace("Z", "+00:00"))
+            except Exception:
+                created_at = datetime.now()
+            try:
+                updated_at = datetime.fromisoformat(str(messages[-1]["timestamp"]).replace("Z", "+00:00"))
+            except Exception:
+                updated_at = datetime.now()
+        else:
+            created_at = updated_at = datetime.now()
 
-        # Restore persisted metadata — without this last_consolidated is always 0
-        # on restart, forcing re-consolidation of the entire history.
-        saved_meta = await self._sqlite_manager.get_session_metadata(key)
-        last_consolidated = saved_meta["last_consolidated"] if saved_meta else 0
-        workspace_key = saved_meta["workspace_key"] if saved_meta else "__workspace__"
-        extra_metadata = saved_meta["extra_metadata"] if saved_meta else {}
-
-        logger.info(f"Loaded {len(messages)} messages for session: {key} (last_consolidated={last_consolidated})")
+        last_consolidated = session_row.get("last_consolidated", 0) if session_row else 0
+        logger.info(
+            "Loaded {} messages for session {} (last_consolidated={})",
+            len(messages), key, last_consolidated,
+        )
         return Session(
             key=key,
             messages=messages,
             created_at=created_at,
             updated_at=updated_at,
             last_consolidated=last_consolidated,
-            metadata={"workspace_key": workspace_key, **extra_metadata},
         )
 
     async def save(self, session: Session) -> None:
-        """Persist session metadata to SQLite and update in-memory cache.
-
-        Individual messages are written by add_message() on every turn.
-        This method persists last_consolidated and workspace_key so that a
-        process restart can resume consolidation from the correct point.
-        """
+        """Persist session metadata and update in-memory cache."""
         if session.key in self._cache:
             self._cache.move_to_end(session.key)
         else:
             while len(self._cache) >= self._CACHE_MAX_SIZE:
                 self._cache.popitem(last=False)
         self._cache[session.key] = session
-        workspace_key = session.metadata.get("workspace_key", "__workspace__")
-        extra = {k: v for k, v in session.metadata.items() if k != "workspace_key"}
+
         try:
-            await self._sqlite_manager.upsert_session_metadata(
-                session_id=session.key,
-                last_consolidated=session.last_consolidated,
-                workspace_key=workspace_key,
-                extra_metadata=extra,
+            await self._db_manager.update_session_consolidated(
+                session.key, session.last_consolidated
             )
         except Exception:
             logger.exception("Failed to persist session metadata for {}", session.key)
-        logger.debug(
-            f"Session {session.key} saved (last_consolidated={session.last_consolidated})."
-        )
+
+        logger.debug("Session {} saved (last_consolidated={}).", session.key, session.last_consolidated)
 
     async def invalidate(self, key: str) -> None:
         """Remove a session from cache."""
         self._cache.pop(key, None)
-        logger.info(f"Session {key} invalidated from cache.")
+        logger.info("Session {} invalidated from cache.", key)
 
     async def add_message(
         self,
         session: Session,
         role: str,
         content: str,
-        raw_data: Optional[Dict[str, Any]] = None,
+        raw_data: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> int:
-        """Persist a message to SQLite and append it to the in-memory session.
+        """Append message to in-memory session.
 
-        raw_data should be the full message dict so agentic fields (tool_calls,
-        tool_call_id, name) survive a reload.
+        In the Postgres path messages are saved directly via DBManager.insert_message()
+        in _save_turn — this method only updates the in-memory session object.
         """
-        presented_data_context = kwargs.pop("presented_data_context", None)
-        message_id = await self._sqlite_manager.insert_message(
-            session_id=session.key,
-            role=role,
-            content=content,
-            presented_data_context=presented_data_context,
-            raw_data=raw_data,
-        )
-        msg: Dict[str, Any] = raw_data.copy() if raw_data else {"role": role, "content": content}
-        msg["id"] = message_id
+        msg: dict[str, Any] = raw_data.copy() if raw_data else {"role": role, "content": content}
         msg.setdefault("timestamp", datetime.now().isoformat())
-        if presented_data_context:
-            msg["presented_data_context"] = presented_data_context
         session.messages.append(msg)
         session.updated_at = datetime.now()
-        return message_id
+        return -1
 
-    async def list_sessions(self) -> List[Dict[str, Any]]:
-        """List all sessions by distinct session_id from the messages table."""
-        await self._sqlite_manager._get_conn()
-        session_keys = await self._sqlite_manager.list_session_keys()
-        return [{"key": key, "path": str(self._sqlite_manager.db_path)} for key in session_keys]
+    async def list_sessions(self) -> list[dict[str, Any]]:
+        """List sessions — returns empty list (no global account listing without account_id)."""
+        return []
 
     async def close(self) -> None:
-        """Close is a no-op here — connection lifetime is owned by the shared SqliteManager."""
-        logger.info(f"HybridSessionManager for workspace {self.workspace} closed (connection managed externally).")
+        """Close is a no-op — connection lifetime is owned by the shared pool."""
+        logger.info(
+            "HybridSessionManager for workspace {} closed (connection managed externally).",
+            self.workspace,
+        )
 
 
 _WORKSPACE_MEMORY_KEY = "__workspace__"
 """
 Constant key used for the workspace-level memory snapshot (analogous to MEMORY.md).
-
-The original file-based memory used a single MEMORY.md shared across ALL sessions
-in a workspace. We preserve that behavior by keying the snapshot on this constant
-rather than on the per-chat session UUID.  History entries (append_history) remain
-session-scoped so their origin is traceable.
 """
 
 
 class HybridMemoryStore:
     """
-    Two-layer memory using SQLite (structured) + zvec (HNSW semantic search).
+    Two-layer memory backed by PostgreSQL + pgvector.
 
-    Replaces the file-based MemoryStore when hybrid memory is enabled.
-    Implements the same interface as MemoryStore (get_memory_context, consolidate,
-    write_long_term, append_history) without inheriting from it to avoid the
-    circular import: stores → agent.memory → agent.__init__ → loop → stores.
-
-    The SqliteManager is shared with HybridSessionManager — do not close it here.
+    Implements get_memory_context, consolidate, write_long_term, append_history.
     """
+
+    _MAX_QUERY_EMBED = 1200   # match pgvector_manager; 500 silently dropped intent at end of long queries
+    _MAX_CONTEXT_CHARS = 6_000
+    # Only inject memories whose cosine similarity exceeds this threshold.
+    # Anything below 0.70 is usually noise and inflates the agent's context window.
+    _MIN_SCORE = 0.70
 
     def __init__(
         self,
         workspace: Path,
-        sqlite_manager: SqliteManager,
-        zvec_manager: ZvecManager,
+        db_manager: "DBManager",
+        vec_manager: "PGVectorManager | None",
         provider: LLMProvider,
-    ):
+    ) -> None:
         self.workspace = workspace
-        self._sqlite_manager = sqlite_manager
-        self._zvec_manager = zvec_manager
         self.provider = provider
-        logger.debug(f"HybridMemoryStore initialized for workspace {workspace}")
+        self._db_manager: "DBManager" = db_manager
+        self._pgvec_manager: "PGVectorManager | None" = vec_manager
 
-    def _resolve_workspace_key(self, workspace_key: str) -> str:
-        """Return the effective memory snapshot key.
+        logger.debug("HybridMemoryStore initialised (postgres=True)")
 
-        If an account_id was threaded through (as workspace_<accountId>), use it.
-        Otherwise fall back to the global workspace constant so all sessions that
-        don't supply an account see the same shared memory.
-        """
-        return workspace_key if workspace_key else _WORKSPACE_MEMORY_KEY
-
-    # Max chars of a user query to embed — prevents sending entire pasted documents.
-    _MAX_QUERY_EMBED = 500
-    # Max total chars of the assembled memory context injected into system prompt.
-    _MAX_CONTEXT_CHARS = 6_000
+    # ── get_memory_context ────────────────────────────────────────────────────
 
     async def get_memory_context(
-        self, session_id: str = "", query: str = "", workspace_key: str = ""
+        self,
+        session_id: str = "",
+        query: str = "",
+        account_id: str = "",
+        user_id: str = "",
+        **_kwargs: Any,
     ) -> str:
-        """Return the memory context string to inject into the system prompt.
-
-        workspace_key scopes memory to a logical tenant (e.g. "workspace_acct123").
-        If not provided, falls back to the global _WORKSPACE_MEMORY_KEY so
-        sessions without an account share the same workspace memory.
-
-        If a query is provided and the embedding model is configured, a semantic
-        search surfaces relevant past history entries to prepend.
-        """
-        effective_key = self._resolve_workspace_key(workspace_key)
+        """Return the memory context string to inject into the system prompt."""
         parts: List[str] = []
 
-        if query and self._zvec_manager:
-            # Truncate query so we never embed an entire pasted document.
+        if query and self._pgvec_manager and account_id and user_id:
             embed_query = query[: self._MAX_QUERY_EMBED]
 
             try:
-                # Search history entries for relevant past conversations
-                hist_results = await self._zvec_manager.semantic_search(
+                results = await self._pgvec_manager.semantic_search(
                     embed_query,
-                    k=5,
-                    filters={"type": "history_entry", "workspace_key": effective_key},
+                    account_id=account_id,
+                    user_id=user_id,
+                    k=8,
+                    content_types=["history_entry", "resultset_label"],
+                    min_score=self._MIN_SCORE,
                 )
-                if hist_results:
-                    lines = [f"- {r[2].get('text', '')}" for r in hist_results if r[2].get("text")]
-                    if lines:
-                        parts.append("## Relevant History\n" + "\n".join(lines))
-            except Exception as e:
-                logger.warning(f"Semantic search (history) failed: {e}")
+                hist_lines = []
+                data_lines = []
+                for content_id, _score, meta in results:
+                    ctype = meta.get("content_type") or meta.get("type", "")
+                    text = meta.get("text_content") or meta.get("text", "")
+                    if not text:
+                        continue
+                    if ctype == "resultset_label" or "resultset_ref" in meta:
+                        ref = meta.get("resultset_ref", "?")
+                        rows_count = meta.get("row_count", "?")
+                        fields_str = ", ".join(meta.get("fields", []))
+                        fetched = meta.get("fetched_at", "")
+                        line = (
+                            f'- "{text}" → resultset_ref={ref} | {rows_count} rows'
+                            + (f" | fields: {fields_str}" if fields_str else "")
+                            + (f" | fetched {fetched}" if fetched else "")
+                        )
+                        data_lines.append(line)
+                    else:
+                        hist_lines.append(f"- {text}")
 
+                if data_lines:
+                    parts.append(
+                        "## Past Related Data You Have Already Collected\n"
+                        + "\n".join(data_lines)
+                        + "\n  → Before fetching fresh data, use this resultset_ref if the "
+                        "user's request is a subset (e.g. city filter)."
+                    )
+                if hist_lines:
+                    parts.append("## Relevant History\n" + "\n".join(hist_lines))
+            except Exception as e:
+                logger.warning("Semantic search skipped: {}", e)
+
+        if account_id:
             try:
-                # Search discovery labels so users can recall past datasets by description
-                # (e.g. "that fintech dataset from last week")
-                disc_results = await self._zvec_manager.semantic_search(
-                    embed_query,
-                    k=3,
-                    filters={"type": "discovery_result", "workspace_key": effective_key},
-                )
-                if disc_results:
-                    lines = [
-                        f"- {r[2].get('text', '')} (discovery id: {r[2].get('discovery_id', '?')})"
-                        for r in disc_results
-                        if r[2].get("text")
-                    ]
-                    if lines:
-                        parts.append("## Past Discovery Datasets\n" + "\n".join(lines))
+                snapshot = await self._db_manager.get_account_memory(account_id)
+                if snapshot:
+                    parts.append(f"## Long-term Memory\n{snapshot}")
             except Exception as e:
-                logger.warning(f"Semantic search (discovery) failed: {e}")
+                logger.warning("Failed to load account memory: {}", e)
 
-        snapshot = await self._sqlite_manager.get_memory_snapshot(effective_key)
-        if snapshot:
-            parts.append(f"## Long-term Memory\n{snapshot}")
+        if not parts:
+            return ""
 
-        result = "\n\n".join(parts) if parts else ""
-        # Cap total memory context to prevent system prompt overflow.
+        # Truncate per-section before joining so no section completely dominates.
+        # Each section gets a fair share; anything beyond its allocation is clipped.
+        per_section = max(1200, self._MAX_CONTEXT_CHARS // max(len(parts), 1))
+        trimmed: List[str] = []
+        for part in parts:
+            if len(part) > per_section:
+                part = part[:per_section] + "\n  [... truncated]"
+            trimmed.append(part)
+
+        result = "\n\n".join(trimmed)
         if len(result) > self._MAX_CONTEXT_CHARS:
             result = result[: self._MAX_CONTEXT_CHARS] + "\n\n[Memory context truncated]"
         return result
+
+    # ── write_long_term ───────────────────────────────────────────────────────
 
     async def write_long_term(
         self,
         session_id: str,
         content: str,
-        associated_message_id: Optional[int] = None,
-        workspace_key: str = "",
+        account_id: str = "",
+        **_kwargs: Any,
     ) -> None:
-        """Overwrite the memory snapshot for the effective workspace key.
+        """Overwrite the memory snapshot."""
+        if not account_id:
+            logger.warning("write_long_term called without account_id")
+            return
+        await self._db_manager.upsert_account_memory(account_id, content)
+        logger.debug("Memory snapshot updated.")
 
-        workspace_key = "workspace_<accountId>" when an account_id was supplied
-        by the client, otherwise the global _WORKSPACE_MEMORY_KEY is used so all
-        sessions share one memory — matching the original MEMORY.md behaviour.
-        """
-        effective_key = self._resolve_workspace_key(workspace_key)
-        await self._sqlite_manager.upsert_memory_snapshot(effective_key, content)
-
-        if self._zvec_manager:
-            try:
-                await self._zvec_manager.add_embedding(
-                    content_id=f"snapshot:{effective_key}",
-                    text=content,
-                    metadata={
-                        "type": "memory_snapshot",
-                        "workspace_key": effective_key,
-                        "text": content,
-                    },
-                )
-            except Exception as e:
-                logger.warning(f"Failed to index memory snapshot in embeddings: {e}")
-
-        logger.debug(f"Memory snapshot updated for workspace_key={effective_key!r}.")
+    # ── append_history ────────────────────────────────────────────────────────
 
     async def append_history(
         self,
         session_id: str,
         entry: str,
-        associated_message_id: Optional[int] = None,
-        workspace_key: str = "",
+        account_id: str = "",
+        user_id: str = "",
+        **_kwargs: Any,
     ) -> None:
-        """Append a history summary entry (analogous to HISTORY.md append)."""
+        """Append a history summary entry."""
         if not entry or not entry.strip():
             logger.debug("Skipping empty history entry for session {}", session_id)
             return
-        effective_key = self._resolve_workspace_key(workspace_key)
-        ltm_id = await self._sqlite_manager.insert_long_term_memory(
-            session_id=session_id,
-            text_content=entry,
-            associated_entity_type="history_entry",
-            associated_entity_id=associated_message_id,
-        )
-        if self._zvec_manager:
-            try:
-                await self._zvec_manager.add_embedding(
-                    content_id=str(ltm_id),
-                    text=entry,
-                    metadata={
-                        "session_id": session_id,
-                        "workspace_key": effective_key,
-                        "type": "history_entry",
-                        "text": entry,
-                    },
-                )
-            except Exception as e:
-                logger.warning(f"Failed to index history entry in embeddings: {e}")
 
-        logger.debug(f"History entry (id: {ltm_id}) appended for session {session_id}.")
+        if not account_id:
+            logger.warning("append_history called without account_id")
+            return
+        try:
+            hist_id = await self._db_manager.insert_memory_history(
+                account_id=account_id,
+                user_id=user_id,
+                session_id=session_id,
+                entry=entry,
+            )
+            if self._pgvec_manager:
+                try:
+                    await self._pgvec_manager.add_embedding(
+                        content_id=f"hist_{hist_id}",
+                        account_id=account_id,
+                        user_id=user_id,
+                        content_type="history_entry",
+                        text=entry,
+                        metadata={
+                            "content_type": "history_entry",
+                            "session_id": session_id,
+                            "text_content": entry,
+                            "text": entry,
+                        },
+                    )
+                except Exception as e:
+                    logger.warning("Failed to index history entry in pgvector: {}", e)
+        except Exception:
+            logger.exception("Failed to append history for session {}", session_id)
+
+    # ── index_resultset_label ─────────────────────────────────────────────────
+
+    async def index_resultset_label(
+        self,
+        resultset_ref: str,
+        label: str,
+        fields: list[str],
+        row_count: int,
+        account_id: str,
+        user_id: str,
+        session_id: str,
+    ) -> None:
+        """Embed a resultset label for future semantic recall."""
+        if not self._pgvec_manager:
+            return
+        try:
+            fetched_at = datetime.now().strftime("%Y-%m-%d")
+            await self._pgvec_manager.add_embedding(
+                content_id=f"rs_{resultset_ref}",
+                account_id=account_id,
+                user_id=user_id,
+                content_type="resultset_label",
+                text=label,
+                metadata={
+                    "content_type": "resultset_label",
+                    "resultset_ref": resultset_ref,
+                    "row_count": row_count,
+                    "fields": fields,
+                    "session_id": session_id,
+                    "fetched_at": fetched_at,
+                    "text_content": label,
+                    "text": label,
+                },
+            )
+        except Exception as e:
+            logger.warning("Failed to index resultset label in pgvector: {}", e)
+
+    # ── consolidate ───────────────────────────────────────────────────────────
 
     async def consolidate(
         self,
@@ -356,62 +414,99 @@ class HybridMemoryStore:
         *,
         archive_all: bool = False,
         memory_window: int = 50,
+        account_id: str = "",
+        user_id: str = "",
     ) -> bool:
         """Consolidate old messages into long-term memory via LLM tool call.
 
-        Returns False when:
-        - LLM provider.chat() raises (no API key, network error, rate limit, model error).
-        - LLM response has no tool call (has_tool_calls is False).
-        - save_memory arguments are missing or wrong type (e.g. not a dict after JSON parse).
-        - append_history() or write_long_term() raises (SQLite/DB error).
-        - Any other exception in the try block (e.g. get_messages_for_session, get_memory_snapshot).
+        Only fetches the *pending* (not-yet-consolidated) portion of the history
+        from the DB to avoid loading the entire message log into memory for long
+        sessions.
         """
-        # Re-sync session messages from DB to avoid stale in-memory state (atomic swap)
-        current_messages_data = await self._sqlite_manager.get_messages_for_session(
-            session.key, limit=-1
-        )
-        new_messages: List[dict] = []
-        for msg_row in current_messages_data:
-            if msg_row.get("raw_data"):
-                msg = dict(msg_row["raw_data"])
+        # Fetch only messages since last_consolidated to bound memory usage.
+        fetch_offset = 0 if archive_all else session.last_consolidated
+        try:
+            messages_data = await self._db_manager.get_messages_for_session(
+                session.key, limit=-1, offset=fetch_offset
+            )
+        except Exception:
+            logger.exception("Failed to reload messages for consolidation (session {})", session.key)
+            return False
+
+        pending_messages: list[dict] = []
+        for msg_row in messages_data:
+            content_raw = msg_row.get("content", {})
+            if isinstance(content_raw, dict):
+                msg = dict(content_raw)
             else:
-                msg = {"role": msg_row["role"], "content": msg_row["content"]}
-            msg.setdefault("timestamp", msg_row.get("timestamp", ""))
-            new_messages.append(msg)
-        session.messages = new_messages
+                try:
+                    msg = json.loads(content_raw)
+                except Exception:
+                    msg = {"role": msg_row.get("role", "user"), "content": str(content_raw)}
+            ts = msg_row.get("created_at", "")
+            msg.setdefault("timestamp", str(ts) if ts else "")
+            pending_messages.append(msg)
 
         if archive_all:
-            old_messages = session.messages
+            old_messages = pending_messages
             keep_count = 0
-            logger.info("Memory consolidation (archive_all): {} messages", len(session.messages))
         else:
             keep_count = memory_window // 2
-            if len(session.messages) <= keep_count:
+            if len(pending_messages) <= keep_count:
                 return True
-            if len(session.messages) - session.last_consolidated <= 0:
-                return True
-            old_messages = session.messages[session.last_consolidated:-keep_count]
+            old_messages = pending_messages[:-keep_count]
             if not old_messages:
                 return True
-            logger.info(
-                "Memory consolidation: {} to consolidate, {} keep",
-                len(old_messages), keep_count,
-            )
 
         lines = []
         for m in old_messages:
             if not m.get("content"):
                 continue
             lines.append(
-                f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}: {m['content']}"
+                f"[{str(m.get('timestamp', '?'))[:16]}] {m['role'].upper()}: {m['content']}"
             )
 
-        # workspace_key is stored in session.metadata by AgentLoop when an account_id
-        # is provided by the client. Falls back to the global key if absent.
-        workspace_key = session.metadata.get("workspace_key", _WORKSPACE_MEMORY_KEY)
-        current_memory = await self._sqlite_manager.get_memory_snapshot(workspace_key) or ""
+        current_memory = ""
+        if account_id:
+            try:
+                current_memory = await self._db_manager.get_account_memory(account_id) or ""
+            except Exception:
+                pass
 
+        return await self._run_consolidation_llm(
+            session=session,
+            provider=provider,
+            model=model,
+            lines=lines,
+            current_memory=current_memory,
+            archive_all=archive_all,
+            keep_count=keep_count,
+            pending_count=len(pending_messages),
+            fetch_offset=fetch_offset,
+            account_id=account_id,
+            user_id=user_id,
+        )
+
+    async def _run_consolidation_llm(
+        self,
+        session: Session,
+        provider: LLMProvider,
+        model: str,
+        lines: list[str],
+        current_memory: str,
+        archive_all: bool,
+        keep_count: int,
+        pending_count: int,
+        fetch_offset: int,
+        account_id: str = "",
+        user_id: str = "",
+    ) -> bool:
+        """LLM call to produce memory consolidation.
+
+        Retries once on tool-call failure to guard against transient LLM non-compliance.
+        """
         prompt = f"""Process this conversation and call the save_memory tool with your consolidation.
+You MUST call the save_memory tool — do not respond with plain text.
 
 ## Current Long-term Memory
 {current_memory or "(empty)"}
@@ -449,96 +544,95 @@ class HybridMemoryStore:
             }
         ]
 
-        try:
-            response = await provider.chat(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a memory consolidation agent. Call the save_memory tool.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                tools=_SAVE_MEMORY_TOOL,
-                model=model,
-            )
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a memory consolidation agent. "
+                    "You MUST respond by calling the save_memory tool. "
+                    "Never output plain text — only tool calls."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
 
-            if not response.has_tool_calls:
-                logger.warning("Memory consolidation: LLM did not call save_memory, skipping")
-                return False
-
-            args = response.tool_calls[0].arguments
-            # Some providers return arguments as a JSON string — normalise to dict.
-            if isinstance(args, str):
-                args = json.loads(args)
-            if not isinstance(args, dict):
-                logger.warning(
-                    "Memory consolidation: unexpected arguments type {}", type(args).__name__
+        # Attempt up to 2 times — retry once if LLM skips the tool call.
+        for attempt in range(2):
+            try:
+                response = await provider.chat(
+                    messages=messages,
+                    tools=_SAVE_MEMORY_TOOL,
+                    model=model,
                 )
+
+                if not response.has_tool_calls:
+                    if attempt == 0:
+                        logger.warning(
+                            "Memory consolidation: LLM did not call save_memory (attempt 1), retrying"
+                        )
+                        # Give the model a nudge on the second attempt
+                        messages = messages + [
+                            {"role": "assistant", "content": response.content or ""},
+                            {
+                                "role": "user",
+                                "content": "You must call the save_memory tool now. Do not reply with text.",
+                            },
+                        ]
+                        continue
+                    logger.warning("Memory consolidation: LLM skipped save_memory after retry, giving up")
+                    return False
+
+                args = response.tool_calls[0].arguments
+                if isinstance(args, str):
+                    args = json.loads(args)
+                if not isinstance(args, dict):
+                    logger.warning(
+                        "Memory consolidation: unexpected arguments type {}", type(args).__name__
+                    )
+                    return False
+
+                if entry := args.get("history_entry"):
+                    if not isinstance(entry, str):
+                        entry = json.dumps(entry, ensure_ascii=False)
+                    await self.append_history(
+                        session.key, entry,
+                        account_id=account_id,
+                        user_id=user_id,
+                    )
+
+                if update := args.get("memory_update"):
+                    if not isinstance(update, str):
+                        update = json.dumps(update, ensure_ascii=False)
+                    if update != current_memory:
+                        await self.write_long_term(
+                            session.key, update,
+                            account_id=account_id,
+                        )
+
+                # Advance the consolidated pointer by the number of messages we summarised.
+                # fetch_offset is where pending messages began; pending_count - keep_count
+                # is how many were summarised.
+                if archive_all:
+                    session.last_consolidated = 0
+                else:
+                    session.last_consolidated = fetch_offset + (pending_count - keep_count)
+
+                logger.info(
+                    "Memory consolidation done: pending={}, summarised={}, last_consolidated={}",
+                    pending_count,
+                    pending_count - keep_count,
+                    session.last_consolidated,
+                )
+                return True
+
+            except Exception:
+                logger.exception("HybridMemoryStore consolidation failed (attempt {})", attempt + 1)
+                if attempt == 0:
+                    continue
                 return False
 
-            if entry := args.get("history_entry"):
-                if not isinstance(entry, str):
-                    entry = json.dumps(entry, ensure_ascii=False)
-                await self.append_history(session.key, entry, workspace_key=workspace_key)
-
-            if update := args.get("memory_update"):
-                if not isinstance(update, str):
-                    update = json.dumps(update, ensure_ascii=False)
-                if update != current_memory:
-                    await self.write_long_term(session.key, update, workspace_key=workspace_key)
-
-            session.last_consolidated = 0 if archive_all else len(session.messages) - keep_count
-            logger.info(
-                "Memory consolidation done: {} messages, last_consolidated={}",
-                len(session.messages), session.last_consolidated,
-            )
-            return True
-        except Exception:
-            logger.exception("HybridMemoryStore consolidation failed")
-            return False
-
-    async def index_discovery_label(
-        self,
-        label: str,
-        discovery_id: int,
-        workspace_key: str = "",
-    ) -> None:
-        """Embed a discovery result label in zvec for cross-session semantic recall.
-
-        The label (e.g. "hp-discovery: 142 rows [id, name, country, revenue]") is embedded
-        so that future sessions can find datasets by description via semantic_search with
-        type="discovery_result". The full payload is NOT embedded — only the compact label.
-
-        Silently no-ops if zvec is not ready (missing embedding model or zvec not installed).
-        """
-        if not self._zvec_manager:
-            return
-        effective_key = self._resolve_workspace_key(workspace_key)
-        try:
-            await self._zvec_manager.add_embedding(
-                content_id=f"disc_{discovery_id}",
-                text=label,
-                metadata={
-                    "type": "discovery_result",
-                    "workspace_key": effective_key,
-                    "discovery_id": str(discovery_id),
-                    "text": label,
-                },
-            )
-        except Exception as e:
-            logger.warning(f"Failed to index discovery label in zvec: {e}")
+        return False
 
     async def close(self) -> None:
-        """Close zvec. The SqliteManager is owned by the caller (AgentLoop) — do not close it here.
-
-        Exit-time errors we guard against: CancelledError (event loop shutting down),
-        logger already torn down, or ZvecManager.close() raising during process exit.
-        """
-        try:
-            if self._zvec_manager:
-                await self._zvec_manager.close()
-            logger.info(f"HybridMemoryStore for workspace {self.workspace} closed.")
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Error closing HybridMemoryStore")
+        """Close is a no-op — pool lifetime is managed by AgentLoop."""
+        logger.info("HybridMemoryStore for workspace {} closed.", self.workspace)

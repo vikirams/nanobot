@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import uuid
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import json_repair
+from loguru import logger
 from openai import AsyncOpenAI
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
@@ -23,12 +24,23 @@ class CustomProvider(LLMProvider):
             default_headers={"x-session-affinity": uuid.uuid4().hex},
         )
 
-    async def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
-                   model: str | None = None, max_tokens: int = 4096, temperature: float = 0.7,
-                   reasoning_effort: str | None = None) -> LLMResponse:
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        thinking: dict[str, Any] | None = None,
+        on_token: Callable[[str], Awaitable[None]] | None = None,
+        on_reasoning_token: Callable[[str], Awaitable[None]] | None = None,
+    ) -> LLMResponse:
+        if on_token or on_reasoning_token:
+            logger.debug("CustomProvider: on_token/on_reasoning_token not supported; streaming disabled")
         kwargs: dict[str, Any] = {
             "model": model or self.default_model,
-            "messages": self._sanitize_empty_content(messages),
+            "messages": self._flatten_content_blocks(self._sanitize_empty_content(messages)),
             "max_tokens": max(1, max_tokens),
             "temperature": temperature,
         }

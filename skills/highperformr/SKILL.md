@@ -1,172 +1,65 @@
 ---
 name: highperformr
-description: Highperformr MCP discovery, deep research orchestration, dataset merging, deduplication, segment activation, and CSV export.
-alwaysLoad: true
+description: Highperformr GTM Engine — general reference for natural-language HP requests not triggered by a slash command. Use for any question about HP tools, how to find/fetch/analyse contacts and companies, or when no focused skill was automatically injected.
+metadata: '{"nanobot": {"always": false}}'
 ---
 
-# Highperformr MCP Skill
+# Highperformr GTM Engine
 
+Use for HP-related natural-language questions. For slash-command operations, focused skills are injected automatically:
 
-## Available MCP Tools
-
-discover  
-push-data-to-segment  
-list-segments  
-import-csv  
-export-contacts  
-run-workflow  
-
-
----
-
-# Discovery Protocol
-
-Discovery always occurs in two phases:
-
-Phase 1 — Database Discovery  
-Phase 2 — Deep Research Augmentation
-
+| Slash Command | Skill Injected |
+|---------------|---------------|
+| `/discovery`  | `hp-discovery` |
+| `/segment`    | `hp-segments` |
+| `/segments`   | `hp-segments` |
+| `/enrich`     | `hp-enrich` |
+| `/merge`      | `hp-dataops` |
+| `/dedupe`     | `hp-dataops` |
+| `/push-to-segment` | `hp-dataops` |
 
 ---
 
-# Phase 1 Database Discovery
+## MCP Tools
 
-Invoke:
+Two tools are available:
 
-discover tool
+- `mcp_<server>_search` — RAG search over the Highperformr OpenAPI spec to find the right endpoint or pattern
+- `mcp_<server>_execute` — runs a sandboxed JavaScript function with `hp` client and optional `resultset_id` pre-loading
 
-Parameters:
+**Standard pattern:**
+```
+search → find endpoint → execute → return result
+```
 
-type = contact OR company  
-query = user discovery intent  
-
-Example:
-
-discover(
- type="contact",
- query="CTOs at fintech companies in India"
-)
-
-
-Store result as primary_dataset
-
+Skip `search` only when you already know the exact endpoint or pattern from this session.
 
 ---
 
-# Phase 2 Deep Research Augmentation
+## Active Resultset
 
-Deep research MUST use promptengineering_deepresearch skill.
-
-Invoke:
-
-discover(
- type="deepsearch",
- query=generated_deep_research_prompt,
- expected_format="json"
-)
-
-
-Store result as deep_research_dataset
-
+When `Active Resultset ID` appears in the runtime context, pass it as `resultset_id` to `mcp_execute`. The server pre-loads `const data = [...]` automatically — do not re-fetch.
 
 ---
 
-# Dataset Merge Protocol
+## Field Prefix Rules — CRITICAL
 
-Merge:
+When writing filter or field-access code:
 
-primary_dataset  
-deep_research_dataset
+| ❌ Wrong | ✅ Correct |
+|---|---|
+| `contact.companyName` | `company.companyName` |
+| `contact.companyWebsite` | `company.companyWebsite` |
+| `contact.companyIndustry` | `company.companyIndustry` |
+| `contact.companyHeadcount` | `company.companyHeadcount` |
 
+**Rule:** `company.*` for all company fields. `contact.*` for personal fields only (name, email, title, phone, LinkedIn, country).
 
-Unified schemas:
-
-Contact schema:
-
-name  
-linkedin_url  
-title  
-company_linkedin  
-company_url  
-
-
-Company schema:
-
-company_name  
-industry  
-company_linkedin  
-company_url  
-
+The `contact.sources` condition is **always required** in `filter-contacts` calls.
 
 ---
 
-# Deduplication Protocol
+## Error Handling
 
-Contact dedupe priority:
-
-linkedin_url  
-name + company_linkedin  
-name + company_url  
-
-
-Company dedupe priority:
-
-company_linkedin  
-company_url  
-company_name  
-
-
-Keep most complete record.
-
-
----
-
-# Segment Push Protocol
-
-Use push-data-to-segment tool only after confirmation.
-
-Example:
-
-push-data-to-segment(
- segment_id="segment123",
- contacts=dataset
-)
-
-
----
-
-# CSV Download Protocol
-
-CSV download is generated locally.
-
-Do NOT use export-contacts tool.
-
-
----
-
-# Segment Listing Protocol
-
-Use list-segments tool when user wants segment selection.
-
-
----
-
-# Workflow Execution Protocol
-
-Use run-workflow only on explicit request.
-
-
----
-
-# Dataset Integrity Rules
-
-Never fabricate data.
-
-Never modify factual values.
-
-Always preserve structure.
-
-
----
-
-END OF SKILL.md
+- First failure: analyse, adjust, retry once.
+- Second failure: stop and report.

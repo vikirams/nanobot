@@ -4,7 +4,9 @@
 set -e
 
 CONFIG_PATH="${NANOBOT_CONFIG_PATH:-/root/.nanobot/config.json}"
-SECRET_ID="${NANOBOT_SECRET_ID:-hp-ai-agent-secrets}"
+# HP_SECRET_ID intentionally does NOT use NANOBOT_ prefix to avoid being injected
+# into the nanobot config dict by _apply_env_overrides in loader.py.
+SECRET_ID="${HP_SECRET_ID:-hp-ai-agent-secrets}"
 REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 
 echo "Fetching config from AWS Secrets Manager (${SECRET_ID})..."
@@ -19,9 +21,7 @@ if [ -n "$SECRET_JSON" ] && [ "$SECRET_JSON" != "None" ]; then
     mkdir -p "$(dirname "$CONFIG_PATH")"
     # Support both: raw JSON string, or key/value secret with e.g. "config" key holding the JSON
     if echo "$SECRET_JSON" | jq -e .config >/dev/null 2>&1; then
-        jq -r '.config' <<EOF > "$CONFIG_PATH"
-$SECRET_JSON
-EOF
+        echo "$SECRET_JSON" | jq -r '.config' > "$CONFIG_PATH"
     else
         echo "$SECRET_JSON" > "$CONFIG_PATH"
     fi

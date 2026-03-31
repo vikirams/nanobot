@@ -8,12 +8,102 @@ from typing import Any, Optional
 # Above this length, tool result content is replaced with a placeholder so the model keeps context without blowing the window.
 MAX_TOOL_RESULT_CHARS = 2000
 
-# Local tools that READ from discovery storage — never write to it.
-# These must never be mistaken for tools that produce new tabular data.
-_LOCAL_READER_TOOLS = ("list_discovery", "get_discovery", "export_discovery", "save_csv")
-
 # Minimum payload size to bother storing in discovery_results (avoids {"status": "ok"} noise).
 _MIN_JSON_STORE_CHARS = 100
+
+# Field names that strongly indicate a contact or company discovery result.
+# Normalised to lowercase-no-separator for comparison.
+# Covers both flat schemas and HP API nested-attributes shapes.
+_CONTACT_COMPANY_SIGNALS: frozenset[str] = frozenset({
+    # Flat / legacy field names
+    "email", "linkedinurl", "firstname", "lastname", "jobtitle", "title",
+    "phone", "mobile", "companyname", "company", "website", "domain",
+    "companydomain", "companywebsite", "companyurl", "contactid", "personid",
+    "hpcontactid", "hpcompanyid",
+    # HP API nested-attributes field names (inside attributes: {...})
+    "fullname", "linkedin", "emails", "phonenumbers",
+})
+
+# Field names that strongly indicate a management-list result (segments, sources,
+# workflow tasks, etc.) — these are NOT contacts/companies.
+_MANAGEMENT_SIGNALS: frozenset[str] = frozenset({
+    "membercount", "segmentid", "sourcetype", "sourcemeta", "templateid",
+    "workflowstatus", "conditions", "fieldmapping", "segmentfolder",
+    "workflowtaskid", "runstatus",
+    # HP API nested-attributes field names for management entities
+    "segmentsources", "groupedcondition", "colourcode", "icp", "icpconfiguration",
+})
+
+# HP API `type` field values that identify contact/company rows.
+_CONTACT_COMPANY_TYPES: frozenset[str] = frozenset({
+    "contact", "person", "company", "organization", "lead",
+})
+
+
+def _normalise_key(k: str) -> str:
+    """Lowercase and strip separators for field signal matching."""
+    return k.lower().replace("_", "").replace("-", "")
+
+
+def classify_result_kind(rows: list[dict]) -> str:
+    """Return 'contact_company' or 'management_list' based on first-row field names.
+
+    contact_company → contacts or companies from discovery APIs.
+                      Eligible for [Preview] sentinel and CSV download.
+    management_list → segments, sources, workflow tasks, schema lists, etc.
+                      Rendered inline by the agent; no preview sentinel, no CSV download.
+
+    Detection strategy (in priority order):
+    1. If a `type` field is present and its value matches a known contact/company type → contact_company.
+    2. Check top-level keys against signal sets.
+    3. Recurse one level into an `attributes` dict (HP API nests everything there).
+    """
+    if not rows or not isinstance(rows[0], dict):
+        return "management_list"
+
+    row = rows[0]
+
+    # 1. type-field shortcut (HP API always includes type: "contact" | "segment" | ...)
+    type_val = row.get("type")
+    if isinstance(type_val, str) and type_val.lower() in _CONTACT_COMPANY_TYPES:
+        return "contact_company"
+
+    # 2. Top-level key signal match
+    keys = {_normalise_key(k) for k in row}
+    discovery_hits = len(keys & _CONTACT_COMPANY_SIGNALS)
+    management_hits = len(keys & _MANAGEMENT_SIGNALS)
+
+    if discovery_hits > management_hits:
+        return "contact_company"
+    if management_hits > discovery_hits:
+        return "management_list"
+
+    # 3. Recurse into `attributes` dict (HP API nesting)
+    attrs = row.get("attributes")
+    if isinstance(attrs, dict):
+        attr_keys = {_normalise_key(k) for k in attrs}
+        attr_discovery = len(attr_keys & _CONTACT_COMPANY_SIGNALS)
+        attr_management = len(attr_keys & _MANAGEMENT_SIGNALS)
+        if attr_discovery > attr_management:
+            return "contact_company"
+        if attr_management > attr_discovery:
+            return "management_list"
+
+    # Default: treat as management list (safer — no CSV download shown)
+    return "management_list"
+
+
+def _extract_rows(data: Any) -> list[dict]:
+    """Return the row list from parsed JSON regardless of envelope shape."""
+    if isinstance(data, list):
+        return [r for r in data if isinstance(r, dict)]
+    if isinstance(data, dict):
+        # "preview" is the MCP execute envelope key for stored resultset responses
+        for key in ("results", "data", "items", "records", "preview"):
+            rows = data.get(key)
+            if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                return rows
+    return []
 
 
 def is_tabular_tool_result(name: str, content: str) -> bool:
@@ -34,13 +124,7 @@ def is_tabular_tool_result(name: str, content: str) -> bool:
     Rejects:
       {"status": "ok"}                            ← not tabular
       ["string1", "string2"]                      ← not objects
-      get_discovery_data result                   ← local reader, excluded by name
     """
-    # Exclude local tools that read FROM storage (not MCP-produced output)
-    n = (name or "").lower()
-    if n.startswith(_LOCAL_READER_TOOLS):
-        return False
-
     stripped = (content or "").strip()
     if not stripped or stripped[0] not in ("{", "["):
         return False
@@ -63,7 +147,9 @@ def is_tabular_tool_result(name: str, content: str) -> bool:
     return False
 
 
-def classify_json_result(name: str, content: str, parsed: Any = None) -> Optional[tuple[str, int]]:
+def classify_json_result(
+    name: str, content: str, parsed: Any = None
+) -> Optional[tuple[str, int]]:
     """Classify a tool result for storage in discovery_results.
 
     Returns (shape, row_count) if the content is valid JSON worth storing, else None.
@@ -71,21 +157,16 @@ def classify_json_result(name: str, content: str, parsed: Any = None) -> Optiona
 
     shape values:
       "array"   — direct JSON array of objects: [{...}, ...]
-      "wrapped" — object with a "data" key containing an array: {"data": [{...}]}
+      "wrapped" — object with a results/data/items key containing an array
       "object"  — any other JSON object: {"key": "value", ...}
 
     row_count is the number of rows for array/wrapped shapes, 0 for plain objects.
 
     Rejects:
-      - Local reader tools (list_discovery, get_discovery, export_discovery, save_csv)
       - Payloads shorter than _MIN_JSON_STORE_CHARS (avoids {"status": "ok"} noise)
       - Non-JSON content (plain text, HTML, etc.)
       - Empty arrays / arrays of non-objects
     """
-    n = (name or "").lower()
-    if any(n.startswith(r) for r in _LOCAL_READER_TOOLS):
-        return None
-
     stripped = (content or "").strip()
     if not stripped or len(stripped) < _MIN_JSON_STORE_CHARS:
         return None
@@ -107,9 +188,11 @@ def classify_json_result(name: str, content: str, parsed: Any = None) -> Optiona
         return ("array", row_count)
 
     if isinstance(data, dict):
-        rows = data.get("data")
-        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
-            return ("wrapped", len(rows))
+        # Check all common envelope keys, not just "data"
+        for key in ("results", "data", "items", "records"):
+            rows = data.get(key)
+            if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                return ("wrapped", len(rows))
         # Plain object — only store if it has meaningful keys (not just a status wrapper)
         if len(data) >= 2:
             return ("object", 0)
@@ -117,10 +200,26 @@ def classify_json_result(name: str, content: str, parsed: Any = None) -> Optiona
     return None
 
 
+def get_result_kind(content: str, parsed: Any = None) -> str:
+    """Return 'contact_company' or 'management_list' for a stored tabular result.
+
+    Used by loop.py to decide whether to emit the [Preview] sentinel hint and
+    whether the result is eligible for CSV download.
+    Falls back to 'management_list' when content cannot be parsed.
+    """
+    try:
+        data = parsed if parsed is not None else json.loads((content or "").strip())
+    except Exception:
+        return "management_list"
+
+    rows = _extract_rows(data)
+    return classify_result_kind(rows)
+
+
 def make_discovery_label(tool_name: str, shape: str, row_count: int, content: str) -> str:
     """Generate a human-readable label for a discovery result.
 
-    Used both for display (list_discovery_results) and as the zvec embedding text
+    Used both for display (list_discovery_results) and as the pgvector embedding text
     so cross-session semantic search can find datasets by description.
 
     Examples:
@@ -152,20 +251,6 @@ def make_discovery_label(tool_name: str, shape: str, row_count: int, content: st
     return f"{short_name}: {row_count} rows" if row_count else short_name
 
 
-# Backward-compat alias used by loop.py — now delegates to content-based check.
-# Callers in loop.py should migrate to is_tabular_tool_result(name, content).
-def is_discovery_tool(name: str) -> bool:
-    """Deprecated: name-only check kept for callers that don't have content.
-    Prefer is_tabular_tool_result(name, content) for accurate detection.
-    """
-    if not name:
-        return False
-    n = name.lower()
-    if n.startswith(_LOCAL_READER_TOOLS):
-        return False
-    return "discovery" in n
-
-
 def prepare_history_for_llm(
     history: list[dict[str, Any]],
     *,
@@ -188,8 +273,7 @@ def prepare_history_for_llm(
                 name = entry.get("name") or ""
                 if classify_json_result(name, content) is not None:
                     entry["content"] = (
-                        "[JSON result (large). Use list_discovery_results to see all datasets; "
-                        "get_discovery_data(which=N) or export_discovery_to_csv(which=N) to query or download.]"
+                        "[JSON result (large). Use list_resultsets to see all datasets collected in this session.]"
                     )
                 else:
                     entry["content"] = (

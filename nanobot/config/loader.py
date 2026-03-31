@@ -1,9 +1,35 @@
 """Configuration loading utilities."""
 
 import json
+import os
 from pathlib import Path
 
 from nanobot.config.schema import Config
+
+
+def _apply_env_overrides(data: dict) -> dict:
+    """
+    Apply NANOBOT_* environment variables into the config data dict.
+
+    Config.model_validate(data) reads only the dict — it skips env vars entirely.
+    This injects NANOBOT_* vars so they override values from config.json
+    (same semantics as Pydantic BaseSettings env priority).
+
+    Example: NANOBOT_DATABASE__URL=postgresql://... → data["database"]["url"] = "..."
+    """
+    prefix = "NANOBOT_"
+    delimiter = "__"
+    for key, value in os.environ.items():
+        if not key.startswith(prefix):
+            continue
+        parts = key[len(prefix):].lower().split(delimiter)
+        d = data
+        for part in parts[:-1]:
+            if part not in d or not isinstance(d[part], dict):
+                d[part] = {}
+            d = d[part]
+        d[parts[-1]] = value
+    return data
 
 
 # Global variable to store current config path (for multi-instance support)
@@ -40,6 +66,7 @@ def load_config(config_path: Path | None = None) -> Config:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
             data = _migrate_config(data)
+            data = _apply_env_overrides(data)
             return Config.model_validate(data)
         except (json.JSONDecodeError, ValueError) as e:
             print(f"Warning: Failed to load config from {path}: {e}")

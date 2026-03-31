@@ -255,14 +255,18 @@ def _make_provider(config: Config):
         console.print("Set one in ~/.nanobot/config.json under providers section")
         raise typer.Exit(1)
 
+    # Prioritize global embedding_model from agents.defaults, then provider-specific
+    emb_model = config.agents.defaults.embedding_model or (p.embedding_model if p else None)
+
     return LiteLLMProvider(
         api_key=p.api_key.get_secret_value() if p else None,
         api_base=config.get_api_base(model),
         default_model=model,
         extra_headers=p.extra_headers if p else None,
         provider_name=provider_name,
-        embedding_model=p.embedding_model if p else None,
+        embedding_model=emb_model,
     )
+
 
 
 def _load_runtime_config(config: str | None = None, workspace: str | None = None) -> Config:
@@ -316,14 +320,10 @@ def gateway(
     bus = MessageBus()
     provider = _make_provider(config)
 
-    if config.enable_hybrid_memory:
-        console.print("[yellow]Hybrid memory enabled for gateway.[/yellow]")
-
     # Create cron service first (callback set after agent creation)
     cron_store_path = get_cron_dir() / "jobs.json"
     cron = CronService(cron_store_path)
 
-    # AgentLoop manages its own session/memory backends based on config.enable_hybrid_memory.
     agent = AgentLoop(
         bus=bus,
         provider=provider,
@@ -385,8 +385,10 @@ def gateway(
         return response
     cron.on_job = on_cron_job
 
-    # Create channel manager
+    # Create channel manager and wire it back to the agent so _ensure_db() can
+    # push the db_manager into WebUIChannel once the Postgres pool is ready.
     channels = ChannelManager(config, bus)
+    agent._channel_manager = channels
 
     async def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages."""
@@ -457,7 +459,7 @@ def gateway(
                 main_task.cancel()
 
         loop = asyncio.get_running_loop()
-        # SIGTERM (docker stop / kill -15) → cancel main tasks → finally block flushes zvec
+        # SIGTERM (docker stop / kill -15) → cancel main tasks → finally block shuts down
         try:
             loop.add_signal_handler(signal.SIGTERM, _request_shutdown)
         except NotImplementedError:
@@ -520,9 +522,6 @@ def agent(
     bus = MessageBus()
     provider = _make_provider(config)
 
-    if config.enable_hybrid_memory:
-        console.print("[yellow]Hybrid memory enabled for agent command.[/yellow]")
-
     # Create cron service for tool usage (no callback needed for CLI unless running)
     cron_store_path = get_cron_dir() / "jobs.json"
     cron = CronService(cron_store_path)
@@ -532,7 +531,6 @@ def agent(
     else:
         logger.disable("nanobot")
 
-    # AgentLoop selects session/memory backends based on config.enable_hybrid_memory.
     agent_loop = AgentLoop(
         bus=bus,
         provider=provider,
@@ -608,7 +606,7 @@ def agent(
                 turn_done.set()
 
             # SIGTERM (docker stop) and SIGINT (Ctrl+C) both trigger graceful shutdown
-            # so agent_loop.close() → zvec.close() runs in the finally block.
+            # so agent_loop.close() → db pool teardown runs in the finally block.
             try:
                 loop.add_signal_handler(signal.SIGTERM, _request_shutdown)
                 loop.add_signal_handler(signal.SIGINT, _request_shutdown)
