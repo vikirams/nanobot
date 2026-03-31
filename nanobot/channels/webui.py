@@ -318,26 +318,7 @@ class WebUIChannel(BaseChannel):
         app.router.add_get("/api/accounts/{account_id}/dna", self._handle_get_dna)
         app.router.add_put("/api/accounts/{account_id}/dna", self._handle_put_dna)
         app.router.add_options("/api/accounts/{account_id}/dna", self._handle_options)
-
-        # ── Static WebUI (built by `vite build`) ──────────────────────────────
-        # Served only when the dist directory exists (production Docker build).
-        # API routes above take priority; the catch-all serves index.html for
-        # any unmatched path so client-side navigation works correctly.
-        _dist = Path(__file__).parent.parent.parent / "webui" / "dist"
-        if _dist.is_dir():
-            app.router.add_static("/assets", _dist / "assets", name="webui_assets")
-            app.router.add_get("/", self._handle_index)
-            app.router.add_get("/{path_info:.*}", self._handle_index)
-            logger.info("WebUI: serving built assets from {}", _dist)
-        else:
-            logger.info("WebUI: no built assets found at {} — static serving disabled", _dist)
-
         return app
-
-    async def _handle_index(self, request: Any) -> Any:
-        from aiohttp import web
-        _dist = Path(__file__).parent.parent.parent / "webui" / "dist"
-        return web.FileResponse(_dist / "index.html")
 
     def _cors_headers(self, request: Any = None) -> dict[str, str]:
         """Build CORS headers from config.

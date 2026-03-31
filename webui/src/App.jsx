@@ -1,11 +1,8 @@
 import { useState, useRef, useEffect, useCallback, memo } from 'react'
 import { marked } from 'marked'
 
-// In production the WebUI is served by the same aiohttp server — use relative
-// URLs so the app works on any domain/IP without a build-time config.
-// In local dev (Vite on :5173) set VITE_GATEWAY_URL=http://localhost:8080 in webui/.env.local
-const GATEWAY = import.meta.env.VITE_GATEWAY_URL || ''
-const REMOTE_AGENT_URL = import.meta.env.VITE_REMOTE_AGENT_URL || ''
+const GATEWAY = import.meta.env.VITE_GATEWAY_URL || 'http://localhost:8080'
+const REMOTE_AGENT_URL = import.meta.env.VITE_REMOTE_AGENT_URL || 'http://localhost:8080'
 const ACCOUNT_ID = import.meta.env.VITE_ACCOUNT_ID || 'TbZomqQGriXFmdvbrznx'
 const USER_ID = import.meta.env.VITE_USER_ID || 'FhXfscdTfTFTgNPZRJUo'
 
